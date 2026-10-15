@@ -105,7 +105,7 @@ MULTA_TRAFICO: el usuario quiere saber la sanción, cuantía, puntos, precepto o
   conducción temeraria...). Alcohol, drogas, VMP y radar son siempre tráfico.
 MULTA_TRANSPORTE: el usuario quiere la sanción o tipificación de un hecho de TRANSPORTE de mercancías/viajeros
   (tacógrafo, tiempos de conducción y descanso, autorización de transporte, ámbito territorial, tarjeta, exceso de peso
-  en transporte, LOTT/ROTT, taxi, VTC, autobús, arrendador, códigos SG...).
+  en transporte, LOTT/ROTT, taxi, VTC, autobús, arrendador, códigos tipo SG01.01, AA02.01, BB01.01...).
 CONSULTA_GENERAL: pregunta conceptual o de conocimiento sobre una norma (qué dice, cómo funciona, requisitos, plazos,
   definiciones, procedimiento, diferencias...) que NO pide rellenar una denuncia ni calcular una sanción concreta.
 
@@ -269,8 +269,20 @@ FUENTE_POR_MODO = {
 # 3. Detección por regex (código SG de transporte, nº de artículo)
 # ------------------------------------------------------------------
 def detectar_codigo(texto: str):
-    m = re.search(r"\bSG\d{2}\.\d{2}\b", texto.upper())
+    m = re.search(r"\b[A-Z]{2}\d{2}\.\d{2}\b", texto.upper())
     return m.group(0) if m else None
+
+
+PATRON_CODIGO_FICHA = re.compile(r"\b[A-Z]{2}\d{2}\.\d{2}\b")
+
+
+def es_ficha_transporte(texto: str) -> bool:
+    return (
+        "Baremo Sancionador de Transportes" in texto
+        or "LOTT" in texto
+        or "ROTT" in texto
+        or bool(PATRON_CODIGO_FICHA.search(texto))
+    )
 
 
 def detectar_articulo(texto: str):
@@ -316,21 +328,40 @@ def _consultar(vector, top_k, filtro):
     return indice_pinecone.query(**kwargs)
 
 
-def buscar_contexto(vector_consulta, top_k: int, filtro: dict | None = None):
-    """Devuelve (contexto_texto, lista_fragmentos, filtro_realmente_usado)."""
-    resultados = _consultar(vector_consulta, top_k, filtro)
-    filtro_usado = filtro
-    if filtro and not resultados.matches:
-        # El filtro no encontró nada (p. ej. faltan metadatos): reintentar sin filtro
-        resultados = _consultar(vector_consulta, top_k, None)
-        filtro_usado = None
+SOBREMUESTREO = 8  # sin metadatos, se piden top_k * 8 resultados y se filtra por texto
 
-    fragmentos = [
-        m.metadata.get("texto", "")
-        for m in resultados.matches
-        if m.metadata and m.metadata.get("texto", "")
-    ]
-    return "\n\n---\n\n".join(fragmentos), fragmentos, filtro_usado
+
+def buscar_contexto(vector_consulta, top_k: int, filtro: dict | None = None, modo: str | None = None):
+    """Devuelve (contexto_texto, lista_fragmentos, descripcion_filtro_usado)."""
+    resultados = _consultar(vector_consulta, top_k, filtro) if filtro else None
+    descripcion = filtro
+
+    if resultados is not None and resultados.matches:
+        fragmentos = [
+            m.metadata.get("texto", "")
+            for m in resultados.matches
+            if m.metadata and m.metadata.get("texto", "")
+        ]
+    else:
+        # Sin metadatos (o el filtro no devolvió nada): sobremuestrear y filtrar por texto
+        pedir = top_k * SOBREMUESTREO if modo in ("MULTA_TRAFICO", "MULTA_TRANSPORTE") else top_k
+        resultados = _consultar(vector_consulta, pedir, None)
+        fragmentos = [
+            m.metadata.get("texto", "")
+            for m in resultados.matches
+            if m.metadata and m.metadata.get("texto", "")
+        ]
+        descripcion = None
+        if modo == "MULTA_TRANSPORTE":
+            fragmentos = [f for f in fragmentos if es_ficha_transporte(f)][:top_k]
+            descripcion = "postfiltro texto: transporte"
+        elif modo == "MULTA_TRAFICO":
+            fragmentos = [f for f in fragmentos if not es_ficha_transporte(f)][:top_k]
+            descripcion = "postfiltro texto: tráfico"
+        else:
+            fragmentos = fragmentos[:top_k]
+
+    return "\n\n---\n\n".join(fragmentos), fragmentos, descripcion
 
 
 # ------------------------------------------------------------------
@@ -391,7 +422,7 @@ if pregunta_usuario:
             vector_pregunta = obtener_embedding(pregunta_usuario)
             filtro = construir_filtro(modo, pregunta_usuario)
             contexto, fragmentos, filtro_usado = buscar_contexto(
-                vector_pregunta, top_k=cfg["top_k"], filtro=filtro
+                vector_pregunta, top_k=cfg["top_k"], filtro=filtro, modo=modo
             )
 
             if MODO_DEBUG:
