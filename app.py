@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 from google import genai
 from google.genai.types import HttpOptions, GenerateContentConfig
@@ -9,7 +10,6 @@ from datetime import datetime, timedelta
 # ------------------------------------------------------------------
 # Logo del proyecto
 # ------------------------------------------------------------------
-# Coloca tu imagen (p. ej. logo.png) en la MISMA carpeta que este app.py.
 RUTA_LOGO = "logo.png"
 LOGO_DISPONIBLE = Path(RUTA_LOGO).exists()
 
@@ -59,7 +59,7 @@ if not verificar_password():
     st.stop()
 
 # ------------------------------------------------------------------
-# Clientes de Gemini y Pinecone (cacheados para velocidad)
+# Clientes de Gemini y Pinecone
 # ------------------------------------------------------------------
 @st.cache_resource
 def obtener_cliente_gemini():
@@ -79,59 +79,226 @@ cliente_gemini = obtener_cliente_gemini()
 indice_pinecone = obtener_indice_pinecone()
 
 # ------------------------------------------------------------------
-# Configuración del Motor RAG (Ultra-rápido y económico)
+# Configuración general
 # ------------------------------------------------------------------
 MODELO_EMBEDDING = "gemini-embedding-001"
-MODELO_GENERACION = "gemini-3.5-flash-lite"  # ⚡ El modelo más rápido y resistente del catálogo
+MODELO_GENERACION = "gemini-3.5-flash-lite"
 DIMENSION_EMBEDDING = 768
-NUM_FRAGMENTOS_CONTEXTO = 1  # 📈 el sistema recupera el artículo exacto que responde a tu pregunta de golpe, sin que le falte ningún matiz.
-VENTANA_HISTORIAL = 8  # 🧠 Nº de mensajes previos (aprox. 4 turnos) que se envían como contexto conversacional
-LIMITE_INACTIVIDAD = timedelta(minutes=60)  # ⏱️ Tras este tiempo sin interacción, se reinicia la conversación
+VENTANA_HISTORIAL = 8
+LIMITE_INACTIVIDAD = timedelta(minutes=60)
 
-INSTRUCCION_SISTEMA = """
-¡ATENCIÓN! REGLA SUPREMA E INQUEBRANTABLE SOBRE PUNTOS: Para el artículo 118 del RGC (falta de guantes o calzado adecuado en motocicletas), la pérdida de puntos es SIEMPRE "0 puntos". Está terminantemente prohibido asignar puntos en este artículo.
+# Filtros por metadatos en Pinecone.
+# Déjalo en False hasta que hayas añadido los campos "fuente" (trafico/transporte),
+# "codigo" (transporte) y "articulo" (tráfico, como número) a tus vectores.
+# Si está en True y el filtro no devuelve nada, se reintenta sin filtro automáticamente.
+USAR_FILTROS_METADATOS = False
+MODO_DEBUG = True  # muestra modo detectado, filtro usado y fragmentos recuperados
 
-Eres un asistente legal de tráfico experto. Tienes TRES fuentes de conocimiento que no debes mezclar:
+# ------------------------------------------------------------------
+# 1. ROUTER: clasifica la consulta
+# ------------------------------------------------------------------
+INSTRUCCION_ROUTER = """
+Clasifica la ÚLTIMA consulta del usuario en UNA de estas categorías y responde SOLO con la etiqueta, sin nada más:
 
-A) CONTEXTO DOCUMENTAL Y MARCO GENERAL DGT: fragmentos normativos recuperados y marco legal general (Ley de Tráfico, RGC y normativa VMP).
+MULTA_TRAFICO: el usuario quiere saber la sanción, cuantía, puntos, precepto o infracción concreta de un hecho de TRÁFICO
+  (velocidad/radar, alcoholemia, drogas, móvil, cinturón, casco, VMP/patinetes, seguro, ITV, semáforos, estacionamiento,
+  conducción temeraria...). Alcohol, drogas, VMP y radar son siempre tráfico.
+MULTA_TRANSPORTE: el usuario quiere la sanción o tipificación de un hecho de TRANSPORTE de mercancías/viajeros
+  (tacógrafo, tiempos de conducción y descanso, autorización de transporte, ámbito territorial, tarjeta, exceso de peso
+  en transporte, LOTT/ROTT, taxi, VTC, autobús, arrendador, códigos SG...).
+CONSULTA_GENERAL: pregunta conceptual o de conocimiento sobre una norma (qué dice, cómo funciona, requisitos, plazos,
+  definiciones, procedimiento, diferencias...) que NO pide rellenar una denuncia ni calcular una sanción concreta.
+
+Usa el historial para entender mensajes cortos de seguimiento (ej. "¿y si es reincidente?" hereda el modo anterior).
+Si dudas entre multa y general, elige CONSULTA_GENERAL salvo que pidan expresamente cuantía, puntos, artículo o "qué multa pone".
+"""
+
+MODOS_VALIDOS = ("MULTA_TRAFICO", "MULTA_TRANSPORTE", "CONSULTA_GENERAL")
+
+
+def clasificar_consulta(pregunta: str, historial: list) -> str:
+    contexto_previo = "\n".join(
+        f"{m['role']}: {m['content'][:300]}" for m in historial[-4:]
+    )
+    prompt = f"HISTORIAL RECIENTE:\n{contexto_previo}\n\nÚLTIMA CONSULTA:\n{pregunta}"
+    try:
+        r = cliente_gemini.models.generate_content(
+            model=MODELO_GENERACION,
+            contents=prompt,
+            config=GenerateContentConfig(
+                system_instruction=INSTRUCCION_ROUTER,
+                max_output_tokens=20,
+                temperature=0,
+            ),
+        )
+        etiqueta = (r.text or "").strip().upper()
+        for modo in MODOS_VALIDOS:
+            if modo in etiqueta:
+                return modo
+    except Exception:
+        pass
+    return "CONSULTA_GENERAL"
+
+
+# ------------------------------------------------------------------
+# 2. PROMPTS POR MODO
+# ------------------------------------------------------------------
+REGLAS_COMUNES = """
+Responde siempre en español, basándote en el CONTEXTO recuperado. Si el contexto no contiene la respuesta,
+dilo claramente en vez de inventar. No repitas un mismo dato en más de una línea.
+"""
+
+INSTRUCCION_MULTA_TRAFICO = REGLAS_COMUNES + """
+MODO MULTA DE TRÁFICO. Eres un asistente de denuncias de tráfico.
+Fuente: Baremo de la DGT (Ley de Tráfico, RGC, normativa VMP). Alcohol, drogas, VMP y radar usan las mismas fichas.
+NO apliques el baremo de transportes (LOTT, ROTT, tacógrafo) en este modo.
+
+ESTRUCTURA DE LAS FICHAS DEL CONTEXTO. Cada ficha contiene:
+  Norma | Artículo | Apartado | Opción | Puntos | Calificación | Hecho infringido | Multa | Responsable | Comentario
+- "Multa" trae DOS importes: el primero es la cuantía completa y el segundo la cuantía reducida (pronto pago).
+- "Puntos" es el dato oficial de la ficha: cópialo tal cual (0 es un valor válido). Nunca lo modifiques ni lo deduzcas.
+- "Calificación" puede incluir el artículo de la LSV que la fundamenta (ej. "Muy grave 077.e").
+- Los ceros a la izquierda del artículo (002, 003) se escriben sin ellos: art. 2, art. 3.
+- Si hay conflicto entre las reglas fijas de este prompt (bloques B y C) y la ficha del contexto, prevalece la ficha.
+
+Reglas:
+1. Elige la ficha cuyo "Hecho infringido" describa exactamente el hecho consultado. Si varias fichas son plausibles
+   (mismo artículo con distintas opciones), NO elijas al azar: pregunta en UNA frase corta el dato que las distingue.
+2. Si ninguna ficha encaja claramente, dilo y no inventes artículo, opción, importe ni puntos.
+3. VMP/VPL: si faltan datos críticos (peso, fecha de comercialización, certificado, registro, etiqueta),
+   PROHIBIDO dar sanción definitiva; pregunta por ellos en una sola frase corta.
+4. Velocidad/radar y alcohol/drogas: si falta algún dato (valor medido, tipo de vía, límite, tipo de conductor...),
+   pregunta antes de calcular.
+5. El campo Comentario úsalo solo si es relevante para el caso (posible delito, compatibilidad con otros
+   expedientes, aclaraciones de aplicación). Resúmelo; no lo copies entero.
+6. Con la ficha identificada, responde SIEMPRE en esta lista, una línea por punto:
+   - Norma y artículo / Precepto: ... (norma, art., apartado, opción)
+   - Infracción: ... (hecho infringido, resumido)
+   - Calificación: ...
+   - Cálculo / Verificación de requisitos: ... (solo si hay cálculo o requisitos; si no, omite la línea)
+   - Cuantía: ... € (cuantía reducida: ... €)
+   - Puntos: ...
+   - Responsable: ...
+   - Comentario: ... (solo si aporta algo; si no, omite)
 
 B) FÓRMULAS Y BAREMOS FIJOS DE VELOCIDAD Y ALCOHOLEMIA:
    - B.1 Corrección de mediciones (etilómetros y radares).
    - B.2 Tabla de excesos de velocidad.
    - B.3 Alcoholemia (tasa corregida y tramos por tipo de conductor).
    - B.4 Umbrales penales de velocidad.
+   [... pega aquí el detalle de tus fórmulas y tablas B.1-B.4, si lo tienes fuera de Pinecone ...]
 
-C) BAREMOS Y REGLAS CONDICIONALES PARA VMP Y VPL (Vehículos de Movilidad Personal y Ligeros):
-   - Criterio de peso: Si pesa más de 25 kg es un VMP (seguro obligatorio siempre). Si pesa menos de 25 kg es un VPL.
+C) VMP Y VPL (Vehículos de Movilidad Personal y Ligeros):
+   - Criterio de peso: más de 25 kg = VMP (seguro obligatorio siempre). Menos de 25 kg = VPL.
    - Requisitos técnicos VPL (<25 kg) / VMP:
-     · Certificado de circulación: exigible solo para comercializados después del 22 de enero de 2024 (si falta y no está exento: VEH 22 B-2-5A, 200/100€, no inmoviliza).
-     · Inscripción en Registro de Vehículos: VEH 22 B-2-5B, 100/50€, no inmoviliza[cite: 2].
-     · Etiqueta identificativa o placa de marcaje: VEH 22 B-2-5C, 80/40€, no inmoviliza[cite: 2].
+     · Certificado de circulación: exigible solo para comercializados después del 22 de enero de 2024
+       (si falta y no está exento: VEH 22 B-2-5A, 200/100€, no inmoviliza).
+     · Inscripción en Registro de Vehículos: VEH 22 B-2-5B, 100/50€, no inmoviliza.
+     · Etiqueta identificativa o placa de marcaje: VEH 22 B-2-5C, 80/40€, no inmoviliza.
    - Modificaciones técnicas:
-     · Muy graves (manipulación velocidad, baterías externas, sin frenos): VEH 22 B-2-5D, 500/250€, SÍ inmoviliza[cite: 2].
-     · Graves (neumáticos rugosos, sin alumbrado): VEH 22 B-2-5E, 200/100€, SÍ inmoviliza[cite: 2].
-     · Leves (sin timbre, catadióptricos, pata de cabra): VEH 22 B-2-5F, 80/40€, NO inmoviliza[cite: 2].
-   - Régimen de Seguros (Jerarquía estricta):
-     · VPL (<25 kg): El seguro de responsabilidad civil (circulando SDA 1-5A 300/150€; sin circular SDA 1-5B 300/150€) **SOLO es denunciable si dispone de Certificado, Registro y Etiqueta**. Si falta alguno de los tres requisitos, el vehículo está **exento** de seguro[cite: 2].
-     · VMP (>25 kg): El seguro es exigible SIEMPRE (circulando SOA 2-1-5N, 800/400€; sin circular SOA 1-5O, 610/305€). SÍ procede inmovilizar[cite: 2].
-
-Reglas de respuesta (POR ORDEN DE PRIORIDAD):
-1. REGLA DE ORO (VMP/VPL): Si te consultan sobre una infracción de VMP o VPL (especialmente seguros o faltas técnicas), y faltan datos críticos como el peso, la fecha de comercialización, si tiene certificado, si está inscrito en el registro o si lleva etiqueta, ESTÁ PROHIBIDO dar una sanción definitiva. Pregunta obligatoriamente por estos datos en una sola frase corta.
-2. Si faltan datos en velocidad/alcohol, aplica también la pregunta corta previa.
-3. Si el documento o las fuentes no especifican de forma expresa que una infracción resta puntos del carnet, indica obligatoriamente "0 puntos" (aplica estrictamente a VMP, VPL y art. 118 de motos).
-4. En MODO TRÁFICO/MULTA (con todos los datos necesarios confirmados), responde SIEMPRE en este formato de lista, una línea por punto:
-   - Norma y artículo / Precepto: ...
-   - Infracción: ...
-   - Cálculo / Verificación de requisitos: ...
-   - Cuantía: ... (cuantía reducida: ...)
-   - Puntos: ... (0 puntos si no se especifica lo contrario)
-   - Responsable: ...
-   - Comentario: ...
-5. Prohibido repetir un mismo dato en más de una línea de la respuesta.
+     · Muy graves (manipulación velocidad, baterías externas, sin frenos): VEH 22 B-2-5D, 500/250€, SÍ inmoviliza.
+     · Graves (neumáticos rugosos, sin alumbrado): VEH 22 B-2-5E, 200/100€, SÍ inmoviliza.
+     · Leves (sin timbre, catadióptricos, pata de cabra): VEH 22 B-2-5F, 80/40€, NO inmoviliza.
+   - Régimen de seguros (jerarquía estricta):
+     · VPL (<25 kg): el seguro de responsabilidad civil (circulando SDA 1-5A 300/150€; sin circular SDA 1-5B 300/150€)
+       SOLO es denunciable si dispone de Certificado, Registro y Etiqueta. Si falta alguno de los tres, el vehículo
+       está exento de seguro.
+     · VMP (>25 kg): el seguro es exigible SIEMPRE (circulando SOA 2-1-5N, 800/400€; sin circular SOA 1-5O, 610/305€).
+       SÍ procede inmovilizar.
 """
 
+INSTRUCCION_MULTA_TRANSPORTE = REGLAS_COMUNES + """
+MODO MULTA DE TRANSPORTE. Eres un asistente de denuncias de transporte terrestre.
+Fuente: Baremo Sancionador de Transportes (LOTT, ROTT y normativa asociada).
+NO apliques el baremo de tráfico (RGC, puntos del carné, VMP) en este modo.
+
+ESTRUCTURA DE LAS FICHAS DEL CONTEXTO. Cada ficha tiene:
+  Código (ej. SG01.01) | Concepto | Infracción (= norma infringida) | Sanción (= norma sancionadora) | Cuantía
+El campo Cuantía puede incluir, además del importe: "Inmovilización" (con su artículo entre paréntesis) y el
+responsable (ej. "Arrendador"). Extráelos tal cual aparecen; no añadas datos que la ficha no contenga.
+
+Reglas:
+1. Elige la ficha cuyo CONCEPTO describa exactamente el hecho consultado. Si varias fichas son plausibles
+   (códigos parecidos), NO elijas al azar: pregunta en UNA frase corta el dato que las distingue.
+2. Si ninguna ficha del contexto encaja claramente, dilo y no inventes código, artículo ni importe.
+3. Si el campo Infracción dice "Según Normativa CCAA" (u otra remisión), indícalo tal cual y avisa de que
+   el precepto concreto depende de esa normativa.
+4. No menciones puntos del carné ni cuantía reducida salvo que la ficha lo diga.
+5. Con la ficha identificada, responde SIEMPRE en esta lista, una línea por punto:
+   - Código: ...
+   - Concepto: ...
+   - Norma infringida: ...
+   - Norma sancionadora: ...
+   - Cuantía: ...
+   - Inmovilización: Sí (art. ...) / No consta
+   - Responsable: ... (solo si la ficha lo indica; si no, "No consta")
+   - Comentario: ... (solo si aporta algo útil; si no, omítelo)
+"""
+
+INSTRUCCION_CONSULTA_GENERAL = REGLAS_COMUNES + """
+MODO CONSULTA GENERAL. El usuario quiere ENTENDER una norma, no tramitar una denuncia.
+- Explica de forma clara y completa, en prosa o con listas cortas si ayudan. Cita la norma y los artículos relevantes.
+- NO uses el formato de boletín de denuncia (Precepto/Infracción/Cuantía/Puntos...) ni inventes "0 puntos".
+- Si la pregunta toca sanciones, menciónalas de forma orientativa y ofrece al final que, si quiere,
+  puedes calcular la multa concreta con los datos del caso.
+- Si la consulta es ambigua entre tráfico y transporte, explica brevemente ambos enfoques.
+"""
+
+CONFIG_MODOS = {
+    "MULTA_TRAFICO": {
+        "prompt": INSTRUCCION_MULTA_TRAFICO, "top_k": 3, "max_tokens": 900,
+        "temp": 0.2, "etiqueta": "🚦 Multa de tráfico",
+    },
+    "MULTA_TRANSPORTE": {
+        "prompt": INSTRUCCION_MULTA_TRANSPORTE, "top_k": 4, "max_tokens": 900,
+        "temp": 0.2, "etiqueta": "🚛 Multa de transporte",
+    },
+    "CONSULTA_GENERAL": {
+        "prompt": INSTRUCCION_CONSULTA_GENERAL, "top_k": 5, "max_tokens": 1200,
+        "temp": 0.4, "etiqueta": "📖 Consulta general",
+    },
+}
+
+FUENTE_POR_MODO = {
+    "MULTA_TRAFICO": "trafico",
+    "MULTA_TRANSPORTE": "transporte",
+    "CONSULTA_GENERAL": None,
+}
+
 # ------------------------------------------------------------------
-# Funciones lógicas
+# 3. Detección por regex (código SG de transporte, nº de artículo)
+# ------------------------------------------------------------------
+def detectar_codigo(texto: str):
+    m = re.search(r"\bSG\d{2}\.\d{2}\b", texto.upper())
+    return m.group(0) if m else None
+
+
+def detectar_articulo(texto: str):
+    m = re.search(r"\bart(?:[íi]culo|\.)?\s*(\d{1,3})", texto.lower())
+    return int(m.group(1)) if m else None
+
+
+def construir_filtro(modo: str, pregunta: str):
+    """Devuelve el filtro de Pinecone para este caso (o None)."""
+    if not USAR_FILTROS_METADATOS:
+        return None
+    filtro = {}
+    fuente = FUENTE_POR_MODO.get(modo)
+    if fuente:
+        filtro["fuente"] = {"$eq": fuente}
+    if modo == "MULTA_TRANSPORTE":
+        codigo = detectar_codigo(pregunta)
+        if codigo:
+            filtro["codigo"] = {"$eq": codigo}
+    elif modo == "MULTA_TRAFICO":
+        articulo = detectar_articulo(pregunta)
+        if articulo is not None:
+            filtro["articulo"] = {"$eq": articulo}
+    return filtro or None
+
+
+# ------------------------------------------------------------------
+# 4. Funciones de búsqueda
 # ------------------------------------------------------------------
 def obtener_embedding(texto: str):
     resultado = cliente_gemini.models.embed_content(
@@ -141,18 +308,30 @@ def obtener_embedding(texto: str):
     )
     return resultado.embeddings[0].values
 
-def buscar_contexto(vector_consulta) -> str:
-    resultados = indice_pinecone.query(
-        vector=vector_consulta,
-        top_k=NUM_FRAGMENTOS_CONTEXTO,
-        include_metadata=True
-    )
+
+def _consultar(vector, top_k, filtro):
+    kwargs = dict(vector=vector, top_k=top_k, include_metadata=True)
+    if filtro:
+        kwargs["filter"] = filtro
+    return indice_pinecone.query(**kwargs)
+
+
+def buscar_contexto(vector_consulta, top_k: int, filtro: dict | None = None):
+    """Devuelve (contexto_texto, lista_fragmentos, filtro_realmente_usado)."""
+    resultados = _consultar(vector_consulta, top_k, filtro)
+    filtro_usado = filtro
+    if filtro and not resultados.matches:
+        # El filtro no encontró nada (p. ej. faltan metadatos): reintentar sin filtro
+        resultados = _consultar(vector_consulta, top_k, None)
+        filtro_usado = None
+
     fragmentos = [
-        match.metadata.get("texto", "")
-        for match in resultados.matches
-        if match.metadata and match.metadata.get("texto", "")
+        m.metadata.get("texto", "")
+        for m in resultados.matches
+        if m.metadata and m.metadata.get("texto", "")
     ]
-    return "\n\n---\n\n".join(fragmentos)
+    return "\n\n---\n\n".join(fragmentos), fragmentos, filtro_usado
+
 
 # ------------------------------------------------------------------
 # Interfaz visual de Chat
@@ -179,8 +358,9 @@ with st.sidebar:
     if st.button("🗑️ Nueva conversación"):
         st.session_state.mensajes = []
         st.rerun()
+    st.caption(f"Filtros por metadatos: {'ON' if USAR_FILTROS_METADATOS else 'OFF'}")
+    st.caption(f"Debug: {'ON' if MODO_DEBUG else 'OFF'}")
 
-# Mostrar el historial de la sesión
 for mensaje in st.session_state.mensajes:
     avatar = AVATAR_ASISTENTE if mensaje["role"] == "assistant" else None
     with st.chat_message(mensaje["role"], avatar=avatar):
@@ -189,49 +369,66 @@ for mensaje in st.session_state.mensajes:
 pregunta_usuario = st.chat_input("Escribe tu consulta legal...")
 
 if pregunta_usuario:
+    historial_previo = list(st.session_state.mensajes)  # antes de añadir la pregunta actual
     st.session_state.mensajes.append({"role": "user", "content": pregunta_usuario})
     with st.chat_message("user"):
         st.markdown(pregunta_usuario)
 
     with st.chat_message("assistant", avatar=AVATAR_ASISTENTE):
-        # Espacio dinámico para el Streaming
         response_placeholder = st.empty()
         texto_acumulado = ""
 
         try:
-            # 1. Recuperar contexto numérico
+            # 0. Clasificar (si hay código SG, es transporte seguro)
+            if detectar_codigo(pregunta_usuario):
+                modo = "MULTA_TRANSPORTE"
+            else:
+                modo = clasificar_consulta(pregunta_usuario, historial_previo)
+            cfg = CONFIG_MODOS[modo]
+            st.caption(cfg["etiqueta"])
+
+            # 1. Recuperar contexto según el modo
             vector_pregunta = obtener_embedding(pregunta_usuario)
-            contexto = buscar_contexto(vector_pregunta)
+            filtro = construir_filtro(modo, pregunta_usuario)
+            contexto, fragmentos, filtro_usado = buscar_contexto(
+                vector_pregunta, top_k=cfg["top_k"], filtro=filtro
+            )
+
+            if MODO_DEBUG:
+                with st.expander(f"🔍 Debug · modo={modo} · filtro={filtro_usado} · {len(fragmentos)} fragmentos"):
+                    for i, f in enumerate(fragmentos, 1):
+                        st.markdown(f"**Fragmento {i}**")
+                        st.text(f[:700])
+
             prompt_actual = f"CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta_usuario}"
 
-            # 1b. Construir la ventana de historial conversacional (sin la pregunta actual,
-            #     que ya está incluida en session_state.mensajes y se añade al final con su contexto)
-            mensajes_previos = st.session_state.mensajes[:-1][-VENTANA_HISTORIAL:]
-            contents_conversacion = []
-            for mensaje_previo in mensajes_previos:
-                rol_gemini = "model" if mensaje_previo["role"] == "assistant" else "user"
-                contents_conversacion.append(
-                    {"role": rol_gemini, "parts": [{"text": mensaje_previo["content"]}]}
-                )
+            # 1b. Historial conversacional
+            mensajes_previos = historial_previo[-VENTANA_HISTORIAL:]
+            contents_conversacion = [
+                {
+                    "role": "model" if m["role"] == "assistant" else "user",
+                    "parts": [{"text": m["content"]}],
+                }
+                for m in mensajes_previos
+            ]
             contents_conversacion.append({"role": "user", "parts": [{"text": prompt_actual}]})
 
-            # 2. Configurar límites estrictos de tokens y creatividad a cero (precisión absoluta)
+            # 2. Config según el modo
             configuracion_ia = GenerateContentConfig(
-                system_instruction=INSTRUCCION_SISTEMA,
-                max_output_tokens=800,  # 🛑 Margen para cálculos paso a paso (corrección + tabla) sin cortar la respuesta
-                temperature=0.4         # 🎯 Evita que la IA invente o decore las respuestas
+                system_instruction=cfg["prompt"],
+                max_output_tokens=cfg["max_tokens"],
+                temperature=cfg["temp"],
             )
 
-            # 3. Llamada en Streaming para respuesta instantánea
-            response_stream = cliente_gemini.models.generate_content_stream(
+            # 3. Streaming
+            for chunk in cliente_gemini.models.generate_content_stream(
                 model=MODELO_GENERACION,
                 contents=contents_conversacion,
-                config=configuracion_ia
-            )
-
-            for chunk in response_stream:
-                texto_acumulado += chunk.text
-                response_placeholder.markdown(texto_acumulado)
+                config=configuracion_ia,
+            ):
+                if chunk.text:
+                    texto_acumulado += chunk.text
+                    response_placeholder.markdown(texto_acumulado)
 
         except Exception as error:
             texto_acumulado = f"Consulta pausada por saturación en la red. Por favor, reintenta en un momento. ({error})"
