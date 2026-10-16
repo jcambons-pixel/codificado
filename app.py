@@ -1,6 +1,9 @@
 import re
 import json
+import time
+import threading
 import streamlit as st
+from collections import deque
 from google import genai
 from google.genai.types import HttpOptions, GenerateContentConfig
 from pinecone import Pinecone
@@ -106,6 +109,7 @@ MODELO_GENERACION = "gemini-3.5-flash-lite"
 DIMENSION_EMBEDDING = 768
 VENTANA_HISTORIAL = 8
 LIMITE_INACTIVIDAD = timedelta(minutes=60)
+MAX_RPM = 12  # peticiones a Gemini por minuto que se permite la app (la cuota real es 15)
 
 # Filtros por metadatos en Pinecone.
 # Déjalo en False hasta que hayas añadido los campos "fuente" (trafico/transporte),
@@ -115,49 +119,179 @@ USAR_FILTROS_METADATOS = False
 MODO_DEBUG = True  # muestra modo detectado, filtro usado y fragmentos recuperados
 
 # ------------------------------------------------------------------
-# 1. ROUTER: clasifica la consulta
+# 0. LIMITADOR DE PETICIONES Y REINTENTOS (cuota de Gemini: 15 RPM)
+#    Todas las llamadas a Gemini (generación y embeddings) pasan por aquí.
+#    El contador es global: se comparte entre todas las sesiones de la app.
 # ------------------------------------------------------------------
-INSTRUCCION_ROUTER = """
-Clasifica la ÚLTIMA consulta del usuario en UNA de estas categorías y responde SOLO con la etiqueta, sin nada más:
+@st.cache_resource
+def _estado_limitador():
+    return {"lock": threading.Lock(), "llamadas": deque()}
+
+
+def esperar_turno():
+    est = _estado_limitador()
+    while True:
+        with est["lock"]:
+            ahora = time.time()
+            while est["llamadas"] and ahora - est["llamadas"][0] > 60:
+                est["llamadas"].popleft()
+            if len(est["llamadas"]) < MAX_RPM:
+                est["llamadas"].append(ahora)
+                return
+            espera = 60 - (ahora - est["llamadas"][0]) + 0.2
+        time.sleep(max(espera, 0.2))
+
+
+def es_error_cuota(error) -> bool:
+    texto = str(error)
+    return "429" in texto or "RESOURCE_EXHAUSTED" in texto
+
+
+def con_reintentos(funcion, intentos: int = 3):
+    for i in range(intentos):
+        esperar_turno()
+        try:
+            return funcion()
+        except Exception as e:
+            if es_error_cuota(e) and i < intentos - 1:
+                time.sleep(5 * (i + 1))
+                continue
+            raise
+
+
+def llamar_gemini(**kwargs):
+    return con_reintentos(lambda: cliente_gemini.models.generate_content(**kwargs))
+
+
+def generar_stream(**kwargs):
+    """Streaming con limitador; reintenta solo si falla antes de emitir el primer fragmento."""
+    for intento in range(3):
+        esperar_turno()
+        emitido = False
+        try:
+            for chunk in cliente_gemini.models.generate_content_stream(**kwargs):
+                emitido = True
+                yield chunk
+            return
+        except Exception as e:
+            if not emitido and es_error_cuota(e) and intento < 2:
+                time.sleep(5 * (intento + 1))
+                continue
+            raise
+
+
+# ------------------------------------------------------------------
+# Datos de cálculo y detección de códigos de transporte
+# (se cargan aquí porque los usa la detección de fichas de transporte)
+# ------------------------------------------------------------------
+@st.cache_resource
+def obtener_datos_calculo():
+    return cargar_datos()  # None si falta la carpeta datos/ (ver preparar_datos.py)
+
+
+DATOS_CALCULO = obtener_datos_calculo()
+
+CLAVES_CODIGO = ("codigo", "código", "code", "cod")
+
+
+def _buscar_codigos(nodo, dentro_de_transporte: bool, salida: set):
+    if isinstance(nodo, dict):
+        for k, v in nodo.items():
+            k_low = str(k).lower()
+            if dentro_de_transporte and k_low in CLAVES_CODIGO and isinstance(v, str) and v.strip():
+                salida.add(v.strip())
+            _buscar_codigos(v, dentro_de_transporte or "transporte" in k_low, salida)
+    elif isinstance(nodo, list):
+        for x in nodo:
+            _buscar_codigos(x, dentro_de_transporte, salida)
+
+
+def extraer_codigos_transporte(datos) -> list:
+    """Recoge los códigos reales del baremo de transporte, sea cual sea su formato.
+    Asume que, en el JSON de datos/, las fichas de transporte cuelgan de una clave que contiene
+    'transporte' y que cada ficha tiene un campo 'codigo'. Ajusta CLAVES_CODIGO si se llama distinto."""
+    salida = set()
+    if datos:
+        try:
+            _buscar_codigos(datos, False, salida)
+        except Exception:
+            pass
+    return sorted(salida)
+
+
+def construir_regex_codigos(codigos: list):
+    """Una sola regex con todos los códigos reales (tolera espacios variables dentro del código)."""
+    ordenados = sorted({c.strip().upper() for c in codigos if c and c.strip()}, key=len, reverse=True)
+    if not ordenados:
+        return None
+    alternativas = "|".join(r"\s+".join(re.escape(parte) for parte in c.split()) for c in ordenados)
+    return re.compile(rf"(?<![A-Z0-9])(?:{alternativas})(?![A-Z0-9])", re.I)
+
+
+PATRON_CODIGO_GENERICO = re.compile(r"\b[A-Z]{2}\d{2}\.\d{2}\b")  # respaldo si no hay códigos reales
+CODIGOS_TRANSPORTE = extraer_codigos_transporte(DATOS_CALCULO)
+RE_CODIGO_TRANSPORTE = construir_regex_codigos(CODIGOS_TRANSPORTE)
+
+# ------------------------------------------------------------------
+# 1. PLANIFICADOR: clasifica la consulta y, si es multa de tráfico, la descompone en hechos
+#    (una sola llamada a Gemini en lugar de dos)
+# ------------------------------------------------------------------
+INSTRUCCION_PLANIFICADOR = """
+Clasifica la ÚLTIMA consulta del usuario en UNA de estas categorías:
 
 MULTA_TRAFICO: el usuario quiere saber la sanción, cuantía, puntos, precepto o infracción concreta de un hecho de TRÁFICO
   (velocidad/radar, alcoholemia, drogas, móvil, cinturón, casco, VMP/patinetes, seguro, ITV, semáforos, estacionamiento,
   conducción temeraria...). Alcohol, drogas, VMP y radar son siempre tráfico.
 MULTA_TRANSPORTE: el usuario quiere la sanción o tipificación de un hecho de TRANSPORTE de mercancías/viajeros
   (tacógrafo, tiempos de conducción y descanso, autorización de transporte, ámbito territorial, tarjeta, exceso de peso
-  en transporte, LOTT/ROTT, taxi, VTC, autobús, arrendador, códigos tipo SG01.01, AA02.01, BB01.01...).
+  en transporte, LOTT/ROTT, taxi, VTC, autobús, arrendador, códigos de infracción del baremo de transportes...).
 CONSULTA_GENERAL: pregunta conceptual o de conocimiento sobre una norma (qué dice, cómo funciona, requisitos, plazos,
   definiciones, procedimiento, diferencias...) que NO pide rellenar una denuncia ni calcular una sanción concreta.
 
 Usa el historial para entender mensajes cortos de seguimiento (ej. "¿y si es reincidente?" hereda el modo anterior).
 Si dudas entre multa y general, elige CONSULTA_GENERAL salvo que pidan expresamente cuantía, puntos, artículo o "qué multa pone".
+
+Además, si la categoría es MULTA_TRAFICO, descompón el caso en los HECHOS INFRACTORES que podrían denunciarse, cada uno
+redactado como lo escribiría el baremo de la DGT en su campo "Hecho infringido" (lenguaje formal:
+"NO SEÑALIZAR REGLAMENTARIAMENTE LA CARGA QUE SOBRESALE...", "CIRCULAR CON UN VEHÍCULO CUYA CARGA...").
+- Máximo 3 hechos; el más importante primero.
+- Incluye solo hechos que se deduzcan de los datos que ha dado el usuario. No añadas infracciones hipotéticas
+  (p. ej. matrícula tapada, circulación nocturna) si no se han mencionado.
+- Si el mensaje es una pregunta de conocimiento y no un caso concreto, "hechos": [].
+En cualquier otra categoría, "hechos": [].
+
+Responde SOLO con JSON válido, sin markdown: {"modo": "<ETIQUETA>", "hechos": ["...", "..."]}
 """
 
 MODOS_VALIDOS = ("MULTA_TRAFICO", "MULTA_TRANSPORTE", "CONSULTA_GENERAL")
 
 
-def clasificar_consulta(pregunta: str, historial: list) -> str:
+def planificar(pregunta: str, historial: list):
+    """Devuelve (modo, hechos). Una sola llamada a Gemini."""
     contexto_previo = "\n".join(
-        f"{m['role']}: {m['content'][:300]}" for m in historial[-4:]
+        f"{m['role']}: {m['content'][:600] if m['role'] == 'user' else m['content'][:300]}"
+        for m in historial[-4:]
     )
     prompt = f"HISTORIAL RECIENTE:\n{contexto_previo}\n\nÚLTIMA CONSULTA:\n{pregunta}"
     try:
-        r = cliente_gemini.models.generate_content(
+        r = llamar_gemini(
             model=MODELO_GENERACION,
             contents=prompt,
             config=GenerateContentConfig(
-                system_instruction=INSTRUCCION_ROUTER,
-                max_output_tokens=20,
+                system_instruction=INSTRUCCION_PLANIFICADOR,
+                max_output_tokens=400,
                 temperature=0,
+                response_mime_type="application/json",
             ),
         )
-        etiqueta = (r.text or "").strip().upper()
-        for modo in MODOS_VALIDOS:
-            if modo in etiqueta:
-                return modo
+        datos = json.loads(re.sub(r"```(?:json)?", "", r.text or "").strip())
+        modo = str(datos.get("modo", "")).strip().upper()
+        if modo not in MODOS_VALIDOS:
+            modo = "CONSULTA_GENERAL"
+        hechos = [h.strip() for h in datos.get("hechos", []) if isinstance(h, str) and h.strip()][:3]
+        return modo, (hechos if modo == "MULTA_TRAFICO" else [])
     except Exception:
-        pass
-    return "CONSULTA_GENERAL"
+        return "CONSULTA_GENERAL", []
 
 
 # ------------------------------------------------------------------
@@ -293,24 +427,43 @@ FUENTE_POR_MODO = {
     "CONSULTA_GENERAL": None,
 }
 
+# Selector de búsqueda (lo elige el usuario encima del chat)
+OPCION_AUTO = "🤖 Automático"
+OPCIONES_MODO = {
+    OPCION_AUTO: None,
+    "🚛 Transporte": "MULTA_TRANSPORTE",
+    "🚦 Resto de infracciones": "MULTA_TRAFICO",
+    "📖 Consulta general": "CONSULTA_GENERAL",
+}
+
 # ------------------------------------------------------------------
-# 3. Detección por regex (código SG de transporte, nº de artículo)
+# 3. Detección por regex (código de infracción de transporte, nº de artículo)
 # ------------------------------------------------------------------
-def detectar_codigo(texto: str):
-    m = re.search(r"\b[A-Z]{2}\d{2}\.\d{2}\b", texto.upper())
+def buscar_codigo_transporte(texto: str):
+    """Busca un código del baremo de transporte: primero entre los códigos reales cargados de datos/,
+    y como respaldo con el patrón genérico (2 letras + 2 dígitos + punto + 2 dígitos)."""
+    if RE_CODIGO_TRANSPORTE:
+        m = RE_CODIGO_TRANSPORTE.search(texto)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0).upper())
+    m = PATRON_CODIGO_GENERICO.search(texto.upper())
     return m.group(0) if m else None
 
 
-PATRON_CODIGO_FICHA = re.compile(r"\b[A-Z]{2}\d{2}\.\d{2}\b")
+def detectar_codigo(texto: str):
+    return buscar_codigo_transporte(texto)
+
+
+CLAVES_TRANSPORTE = (
+    "BAREMO SANCIONADOR DE TRANSPORTES", "LOTT", "ROTT", "VTC",
+    "ARRENDAMIENTO DE VEHÍCULOS CON CONDUCTOR", "ARRENDAMIENTO DE VEHICULOS CON CONDUCTOR",
+    "DECRETO-LEY", "DECRETO LEY",
+)
 
 
 def es_ficha_transporte(texto: str) -> bool:
-    return (
-        "Baremo Sancionador de Transportes" in texto
-        or "LOTT" in texto
-        or "ROTT" in texto
-        or bool(PATRON_CODIGO_FICHA.search(texto))
-    )
+    t = texto.upper()
+    return any(k in t for k in CLAVES_TRANSPORTE) or bool(buscar_codigo_transporte(texto))
 
 
 def detectar_articulo(texto: str):
@@ -340,13 +493,32 @@ def construir_filtro(modo: str, pregunta: str):
 # ------------------------------------------------------------------
 # 4. Funciones de búsqueda
 # ------------------------------------------------------------------
+@st.cache_resource
+def _cache_embeddings():
+    return {}
+
+
+def obtener_embeddings(textos: list):
+    """Embeddings de varios textos en UNA sola petición. Los ya calculados se reutilizan."""
+    cache = _cache_embeddings()
+    if len(cache) > 500:
+        cache.clear()
+    faltan = list(dict.fromkeys(t for t in textos if t not in cache))
+    if faltan:
+        r = con_reintentos(
+            lambda: cliente_gemini.models.embed_content(
+                model=MODELO_EMBEDDING,
+                contents=faltan,
+                config={"output_dimensionality": DIMENSION_EMBEDDING},
+            )
+        )
+        for texto, emb in zip(faltan, r.embeddings):
+            cache[texto] = emb.values
+    return [cache[t] for t in textos]
+
+
 def obtener_embedding(texto: str):
-    resultado = cliente_gemini.models.embed_content(
-        model=MODELO_EMBEDDING,
-        contents=texto,
-        config={"output_dimensionality": DIMENSION_EMBEDDING},
-    )
-    return resultado.embeddings[0].values
+    return obtener_embeddings([texto])[0]
 
 
 def _consultar(vector, top_k, filtro):
@@ -381,7 +553,10 @@ def buscar_contexto(vector_consulta, top_k: int, filtro: dict | None = None, mod
         ]
         descripcion = None
         if modo == "MULTA_TRANSPORTE":
-            fragmentos = [f for f in fragmentos if es_ficha_transporte(f)][:top_k]
+            # Primero las fichas de transporte; si faltan, se completa con el resto para no dejar el contexto vacío
+            filtrados = [f for f in fragmentos if es_ficha_transporte(f)]
+            resto = [f for f in fragmentos if f not in filtrados]
+            fragmentos = (filtrados + resto)[:top_k]
             descripcion = "postfiltro texto: transporte"
         elif modo == "MULTA_TRAFICO":
             fragmentos = [f for f in fragmentos if not es_ficha_transporte(f)][:top_k]
@@ -412,8 +587,8 @@ def buscar_contexto_multi(vectores: list, top_k: int, filtro: dict | None = None
 
 # ------------------------------------------------------------------
 # 4b. Descomposición de casos de tráfico en hechos infractores
-#     Un mismo caso puede encerrar varias infracciones (p. ej. carga que sobresale + señalización
-#     no reglamentaria). Cada hecho se redacta como lo haría el baremo y se busca por separado.
+#     En modo automático lo hace el planificador (una sola llamada).
+#     Esta función se usa cuando el usuario fuerza "Resto de infracciones".
 # ------------------------------------------------------------------
 INSTRUCCION_DESCOMPOSITOR = """
 Eres un asistente de denuncias de tráfico en España. Descompón el caso del ÚLTIMO MENSAJE en los HECHOS INFRACTORES
@@ -433,7 +608,7 @@ def descomponer_hechos(pregunta: str, historial: list) -> list:
     )
     prompt = f"HISTORIAL:\n{contexto}\n\nÚLTIMO MENSAJE:\n{pregunta}"
     try:
-        r = cliente_gemini.models.generate_content(
+        r = llamar_gemini(
             model=MODELO_GENERACION,
             contents=prompt,
             config=GenerateContentConfig(
@@ -453,14 +628,6 @@ def descomponer_hechos(pregunta: str, historial: list) -> list:
 # 5. CÁLCULOS (tiempos de conducción, masas, dimensiones)
 #    La IA solo EXTRAE los datos del relato; Python hace las cuentas y elige la ficha.
 # ------------------------------------------------------------------
-@st.cache_resource
-def obtener_datos_calculo():
-    return cargar_datos()  # None si falta la carpeta datos/ (ver preparar_datos.py)
-
-
-DATOS_CALCULO = obtener_datos_calculo()
-
-
 @st.cache_resource
 def obtener_indices_lexicos():
     if not (BUSCADOR_OK and DATOS_CALCULO):
@@ -500,9 +667,12 @@ RE_CALCULO = re.compile(
 
 
 def parece_calculo(pregunta: str, calculo_reciente: bool) -> bool:
-    if calculo_reciente:  # el mensaje puede completar o variar el cálculo anterior ("público", "sin autorización"...)
-        return True
-    return bool(re.search(r"\d", pregunta)) and bool(RE_CALCULO.search(pregunta))
+    tiene_cifras = bool(re.search(r"\d", pregunta))
+    if calculo_reciente:
+        # el mensaje puede completar o variar el cálculo anterior ("público", "sin autorización"...),
+        # pero un mensaje largo y sin cifras es casi seguro otra consulta
+        return tiene_cifras or len(pregunta.split()) <= 12
+    return tiene_cifras and bool(RE_CALCULO.search(pregunta))
 
 
 def extraer_calculo(pregunta: str, historial: list):
@@ -511,7 +681,7 @@ def extraer_calculo(pregunta: str, historial: list):
     )
     prompt = f"HISTORIAL:\n{contexto}\n\nÚLTIMO MENSAJE:\n{pregunta}"
     try:
-        r = cliente_gemini.models.generate_content(
+        r = llamar_gemini(
             model=MODELO_GENERACION,
             contents=prompt,
             config=GenerateContentConfig(
@@ -578,15 +748,34 @@ with st.sidebar:
     if st.button("🗑️ Nueva conversación"):
         st.session_state.mensajes = []
         st.session_state.calculo_reciente = False
+        st.session_state.selector_modo = OPCION_AUTO  # se asigna antes de crear el radio, por eso es válido
         st.rerun()
     st.caption(f"Filtros por metadatos: {'ON' if USAR_FILTROS_METADATOS else 'OFF'}")
     st.caption(f"Debug: {'ON' if MODO_DEBUG else 'OFF'}")
+    st.caption(f"Límite de peticiones a Gemini: {MAX_RPM}/min")
     if not CALCULOS_OK:
         st.caption("Calculadoras: OFF (falta calculos.py junto a app.py)")
     elif not DATOS_CALCULO:
         st.caption("Calculadoras: OFF (falta la carpeta datos/ con los 2 JSON)")
     else:
         st.caption("Calculadoras: ON")
+    if MODO_DEBUG:
+        st.caption(f"Códigos de transporte cargados: {len(CODIGOS_TRANSPORTE)}")
+
+# Selector de dónde buscar
+seleccion = st.radio(
+    "Buscar en",
+    list(OPCIONES_MODO),
+    horizontal=True,
+    key="selector_modo",
+)
+modo_forzado = OPCIONES_MODO[seleccion]
+
+if modo_forzado:
+    st.info(
+        f"Búsqueda limitada a **{seleccion}**. "
+        "Cambia a «Automático» para que el asistente decida."
+    )
 
 for mensaje in st.session_state.mensajes:
     avatar = AVATAR_ASISTENTE if mensaje["role"] == "assistant" else None
@@ -607,9 +796,14 @@ if pregunta_usuario:
 
         try:
             # 0. ¿Es un cálculo (tiempos, masas, dimensiones)? La IA extrae, Python calcula.
+            #    En "Consulta general" forzada no se usan las calculadoras.
             resultado_calculo = {"estado": "sin_calculo", "texto": "", "etiqueta": ""}
             extraccion = None
-            if DATOS_CALCULO and parece_calculo(pregunta_usuario, st.session_state.get("calculo_reciente", False)):
+            if (
+                DATOS_CALCULO
+                and modo_forzado != "CONSULTA_GENERAL"
+                and parece_calculo(pregunta_usuario, st.session_state.get("calculo_reciente", False))
+            ):
                 extraccion = extraer_calculo(pregunta_usuario, historial_previo)
                 if extraccion:
                     resultado_calculo = calcular(extraccion, DATOS_CALCULO)
@@ -629,28 +823,31 @@ if pregunta_usuario:
                 prompt_actual = f"{texto_calc}\n\nPREGUNTA:\n{pregunta_usuario}"
             else:
                 st.session_state.calculo_reciente = False
-                # 1. Clasificar (si hay código de transporte tipo SG01.01, es transporte seguro)
-                if detectar_codigo(pregunta_usuario):
-                    modo = "MULTA_TRANSPORTE"
+
+                # 1. Modo: el elegido por el usuario o, en automático, el que decida el planificador
+                hechos = []
+                if modo_forzado:
+                    modo = modo_forzado
+                    if modo == "MULTA_TRAFICO":
+                        hechos = descomponer_hechos(pregunta_usuario, historial_previo)
+                elif detectar_codigo(pregunta_usuario):
+                    modo = "MULTA_TRANSPORTE"  # con un código de infracción de transporte es transporte seguro
                 else:
-                    modo = clasificar_consulta(pregunta_usuario, historial_previo)
+                    modo, hechos = planificar(pregunta_usuario, historial_previo)
                 cfg = CONFIG_MODOS[modo]
-                st.caption(cfg["etiqueta"])
+                st.caption(cfg["etiqueta"] + (" · elegido por ti" if modo_forzado else ""))
 
                 # 2. Recuperar contexto según el modo (en multa de tráfico: un hecho infractor por consulta)
-                consultas = [pregunta_usuario]
-                hechos = []
-                if modo == "MULTA_TRAFICO":
-                    hechos = descomponer_hechos(pregunta_usuario, historial_previo)
-                    consultas = hechos + [pregunta_usuario]
-                vectores = [obtener_embedding(c) for c in consultas]
+                consultas = hechos + [pregunta_usuario] if hechos else [pregunta_usuario]
+                vectores = obtener_embeddings(consultas)  # una sola petición para todas las consultas
                 filtro = construir_filtro(modo, pregunta_usuario)
                 contexto, fragmentos, filtro_usado = buscar_contexto_multi(
                     vectores, top_k=cfg["top_k"], filtro=filtro, modo=modo,
                     limite_total=cfg["top_k"] * 2 if len(consultas) > 1 else None,
                 )
                 if INDICES_LEXICOS and modo in ("MULTA_TRAFICO", "MULTA_TRANSPORTE"):
-                    # Búsqueda por palabras clave: rescata fichas cortas o genéricas que el embedding no encuentra
+                    # Búsqueda por palabras clave (local, no gasta cuota): rescata fichas cortas o genéricas
+                    # que el embedding no encuentra
                     listas_lex = buscar_lexico(INDICES_LEXICOS, DATOS_CALCULO, modo, consultas, k=3)
                     fragmentos = fusionar(fragmentos, listas_lex, cfg["top_k"] * 2 + 2)
                     contexto = "\n\n---\n\n".join(fragmentos)
@@ -681,8 +878,8 @@ if pregunta_usuario:
                 temperature=cfg["temp"],
             )
 
-            # 3. Streaming
-            for chunk in cliente_gemini.models.generate_content_stream(
+            # 3. Streaming (pasa por el limitador de peticiones)
+            for chunk in generar_stream(
                 model=MODELO_GENERACION,
                 contents=contents_conversacion,
                 config=configuracion_ia,
