@@ -339,4 +339,194 @@ def descomponer_hechos(pregunta: str, historial: list) -> list:
             model=MODELO_GENERACION,
             contents=prompt,
             config=GenerateContentConfig(
-                system_instruction=
+                system_instruction=INSTRUCCION_DESCOMPOSITOR,
+                max_output_tokens=200,
+                temperature=0,
+                response_mime_type="application/json",
+            ),
+        )
+        datos = json.loads(re.sub(r"```(?:json)?", "", r.text or "").strip())
+        return [h.strip() for h in datos.get("hechos", []) if isinstance(h, str) and h.strip()][:2]
+    except Exception:
+        return []
+
+# ------------------------------------------------------------------
+# 5. Cálculos y Extractor
+# ------------------------------------------------------------------
+@st.cache_resource
+def obtener_datos_calculo():
+    return cargar_datos()
+
+DATOS_CALCULO = obtener_datos_calculo()
+
+INSTRUCCION_EXTRACTOR = """
+Extractor de datos para calculadoras de transporte y tráfico. Devuelve SOLO un JSON válido:
+{
+ "calculo": "tiempos" | "masas" | "dimensiones" | "cargas" | null,
+ "tiempos": null, "masas": null, "dimensiones": null, "cargas": null
+}
+"""
+
+@con_reintento_api
+def extraer_calculo(pregunta: str, historial: list):
+    contexto = "\n".join(
+        f"{m['role']}: {m['content'][:400]}" for m in historial[-4:]
+    )
+    prompt = f"HISTORIAL:\n{contexto}\n\nÚLTIMO MENSAJE:\n{pregunta}"
+    try:
+        r = cliente_gemini.models.generate_content(
+            model=MODELO_GENERACION,
+            contents=prompt,
+            config=GenerateContentConfig(
+                system_instruction=INSTRUCCION_EXTRACTOR,
+                max_output_tokens=600,
+                temperature=0,
+                response_mime_type="application/json",
+            ),
+        )
+        bruto = re.sub(r"```(?:json)?", "", r.text or "").strip()
+        return json.loads(bruto)
+    except Exception:
+        return None
+
+INSTRUCCION_CALCULO = REGLAS_COMUNES + """
+MODO CÁLCULO. Usa el bloque "RESULTADO DEL CÁLCULO" verificado por código. No inventes datos.
+"""
+CONFIG_MODOS["CALCULO"] = {
+    "prompt": INSTRUCCION_CALCULO, "top_k": 0, "max_tokens": 1000,
+    "temp": 0.1, "etiqueta": "🧮 Cálculo",
+}
+
+# ------------------------------------------------------------------
+# Interfaz visual de Chat
+# ------------------------------------------------------------------
+columna_logo, columna_titulo = st.columns([1, 6])
+with columna_logo:
+    if LOGO_DISPONIBLE:
+        st.image(RUTA_LOGO, width=60)
+with columna_titulo:
+    st.title("Asistente Legal")
+
+if "mensajes" not in st.session_state:
+    st.session_state.mensajes = []
+
+if "ultima_interaccion" not in st.session_state:
+    st.session_state.ultima_interaccion = datetime.now()
+
+if datetime.now() - st.session_state.ultima_interaccion > LIMITE_INACTIVIDAD:
+    st.session_state.mensajes = []
+    st.session_state.calculo_reciente = False
+
+st.session_state.ultima_interaccion = datetime.now()
+
+with st.sidebar:
+    if st.button("🗑️ Nueva conversación"):
+        st.session_state.mensajes = []
+        st.session_state.calculo_reciente = False
+        st.rerun()
+    st.caption(f"Filtros metadatos: {'ON' if USAR_FILTROS_METADATOS else 'OFF'}")
+    st.caption(f"Debug: {'ON' if MODO_DEBUG else 'OFF'}")
+    if not CALCULOS_OK:
+        st.caption("Calculadoras: OFF")
+    elif not DATOS_CALCULO:
+        st.caption("Calculadoras: OFF (falta carpeta datos/)")
+    else:
+        st.caption("Calculadoras: ON")
+
+for mensaje in st.session_state.mensajes:
+    avatar = AVATAR_ASISTENTE if mensaje["role"] == "assistant" else None
+    with st.chat_message(mensaje["role"], avatar=avatar):
+        st.markdown(mensaje["content"])
+
+pregunta_usuario = st.chat_input("Escribe tu consulta legal...")
+
+if pregunta_usuario:
+    historial_previo = list(st.session_state.mensajes)
+    st.session_state.mensajes.append({"role": "user", "content": pregunta_usuario})
+    with st.chat_message("user"):
+        st.markdown(pregunta_usuario)
+
+    with st.chat_message("assistant", avatar=AVATAR_ASISTENTE):
+        contenedor_respuesta = st.empty()
+        
+        # 1. Router / Clasificación
+        modo = clasificar_consulta(pregunta_usuario, historial_previo)
+        
+        # 2. Lógica de cálculo o búsqueda vectorial
+        texto_calculo = ""
+        resultado_calculo = None
+        if CALCULOS_OK and DATOS_CALCULO and ('calculo_reciente' in st.session_state and st.session_state.calculo_reciente):
+            datos_extraccion = extraer_calculo(pregunta_usuario, historial_previo)
+            if datos_extraccion and datos_extraccion.get("calculo"):
+                resultado_calculo = calcular(datos_extraccion, DATOS_CALCULO)
+                if resultado_calculo["estado"] in ("ok", "faltan_datos", "multiples_opciones"):
+                    modo = "CALCULO"
+                    texto_calculo = f"\n\nRESULTADO DEL CÁLCULO:\n{resultado_calculo['texto']}"
+
+        cfg = CONFIG_MODOS.get(modo, CONFIG_MODOS["CONSULTA_GENERAL"])
+        
+        # 3. Búsqueda en Pinecone si aplica
+        contexto_recuperado = ""
+        fragmentos_usados = []
+        filtro_usado = None
+        
+        if modo != "CALCULO" and cfg["top_k"] > 0:
+            filtro = construir_filtro(modo, pregunta_usuario)
+            if modo == "MULTA_TRAFICO":
+                hechos = descomponer_hechos(pregunta_usuario, historial_previo)
+                if len(hechos) > 1:
+                    vectores = [obtener_embedding(h) for h in hechos]
+                    contexto_recuperado, fragmentos_usados, filtro_usado = buscar_contexto_multi(
+                        vectores, cfg["top_k"], filtro, modo
+                    )
+                else:
+                    vec = obtener_embedding(hechos[0] if hechos else pregunta_usuario)
+                    contexto_recuperado, fragmentos_usados, filtro_usado = buscar_contexto(
+                        vec, cfg["top_k"], filtro, modo
+                    )
+            else:
+                vec = obtener_embedding(pregunta_usuario)
+                contexto_recuperado, fragmentos_usados, filtro_usado = buscar_contexto(
+                    vec, cfg["top_k"], filtro, modo
+                )
+
+        # 4. Generación de respuesta con Gemini
+        historial_recortado = historial_previo[-VENTANA_HISTORIAL:]
+        contenido_chat = "\n".join([f"{m['role']}: {m['content']}" for m in historial_recortado])
+        
+        prompt_final = f"""
+{cfg['prompt']}
+
+CONTEXTO RECUPERADO:
+{contexto_recuperado}
+{texto_calculo}
+
+HISTORIAL DE CONVERSACIÓN:
+{contenido_chat}
+
+ÚLTIMA CONSULTA DEL USUARIO:
+{pregunta_usuario}
+"""
+        
+        try:
+            @con_reintento_api
+            def generar_respuesta_gemini():
+                return cliente_gemini.models.generate_content(
+                    model=MODELO_GENERACION,
+                    contents=prompt_final,
+                    config=GenerateContentConfig(
+                        max_output_tokens=cfg["max_tokens"],
+                        temperature=cfg["temp"],
+                    ),
+                )
+
+            respuesta = generar_respuesta_gemini()
+            texto_respuesta = respuesta.text or "No se ha podido generar una respuesta."
+        except Exception as e:
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                texto_respuesta = "⚠️ El servicio está experimentando alta demanda en este momento (error 503). Por favor, reintenta enviar tu mensaje en unos segundos."
+            else:
+                texto_respuesta = f"⚠️ Ocurrió un error al procesar tu solicitud: {e}"
+
+        contenedor_respuesta.markdown(texto_respuesta)
+        st.session_state.mensajes.append({"role": "assistant", "content": texto_respuesta})
