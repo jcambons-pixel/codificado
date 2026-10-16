@@ -195,6 +195,10 @@ Reglas:
    - Puntos: ...
    - Responsable: ...
    - Comentario: ... (solo si aporta algo; si no, omite)
+7. Si el caso contiene VARIAS infracciones distintas (p. ej. carga que sobresale + señalización no reglamentaria),
+   presenta una lista por cada una, con una ficha del CONTEXTO que encaje exactamente con ese hecho. No añadas
+   infracciones hipotéticas que el usuario no haya mencionado. Si para alguna falta un dato (p. ej. si circulaba de noche),
+   pregúntalo al final en una frase corta. Si una infracción del caso no tiene ficha en el CONTEXTO, dilo en vez de inventarla.
 
 B) FÓRMULAS Y BAREMOS FIJOS DE VELOCIDAD Y ALCOHOLEMIA:
    - B.1 Corrección de mediciones (etilómetros y radares).
@@ -379,17 +383,61 @@ def buscar_contexto(vector_consulta, top_k: int, filtro: dict | None = None, mod
     return "\n\n---\n\n".join(fragmentos), fragmentos, descripcion
 
 
-def buscar_contexto_multi(vectores: list, top_k: int, filtro: dict | None = None, modo: str | None = None):
-    """Busca con varios vectores y une los resultados sin duplicados."""
-    vistos, fragmentos, descripcion = set(), [], None
+def buscar_contexto_multi(vectores: list, top_k: int, filtro: dict | None = None, modo: str | None = None,
+                          limite_total: int | None = None):
+    """Busca con varios vectores y une los resultados sin duplicados, repartiendo por turnos
+    (el 1.º de cada consulta, luego el 2.º de cada una...) para que ningún hecho se quede sin ficha."""
+    listas, descripcion = [], None
     for v in vectores:
         _, frs, descripcion = buscar_contexto(v, top_k, filtro, modo)
-        for f in frs:
-            if f not in vistos:
-                vistos.add(f)
-                fragmentos.append(f)
-    fragmentos = fragmentos[: top_k * 2]
+        listas.append(frs)
+    vistos, fragmentos = set(), []
+    for i in range(max((len(l) for l in listas), default=0)):
+        for l in listas:
+            if i < len(l) and l[i] not in vistos:
+                vistos.add(l[i])
+                fragmentos.append(l[i])
+    fragmentos = fragmentos[: (limite_total or top_k * 2)]
     return "\n\n---\n\n".join(fragmentos), fragmentos, descripcion
+
+
+# ------------------------------------------------------------------
+# 4b. Descomposición de casos de tráfico en hechos infractores
+#     Un mismo caso puede encerrar varias infracciones (p. ej. carga que sobresale + señalización
+#     no reglamentaria). Cada hecho se redacta como lo haría el baremo y se busca por separado.
+# ------------------------------------------------------------------
+INSTRUCCION_DESCOMPOSITOR = """
+Eres un asistente de denuncias de tráfico en España. Descompón el caso del ÚLTIMO MENSAJE en los HECHOS INFRACTORES
+que podrían denunciarse, cada uno redactado como lo escribiría el baremo de la DGT en su campo "Hecho infringido"
+(lenguaje formal: "NO SEÑALIZAR REGLAMENTARIAMENTE LA CARGA QUE SOBRESALE...", "CIRCULAR CON UN VEHÍCULO CUYA CARGA...").
+Responde SOLO con JSON válido, sin markdown: {"hechos": ["...", "..."]}  (máximo 3; el más importante primero).
+- Incluye solo hechos que se deduzcan de los datos que ha dado el usuario. No añadas infracciones hipotéticas
+  (p. ej. matrícula tapada, circulación nocturna) si no se han mencionado.
+- Un caso puede contener varios hechos distintos (p. ej. carga que sobresale más de lo permitido Y señalización no reglamentaria).
+- Si el mensaje es una pregunta de conocimiento y no un caso concreto, responde {"hechos": []}.
+"""
+
+
+def descomponer_hechos(pregunta: str, historial: list) -> list:
+    contexto = "\n".join(
+        f"{m['role']}: {m['content'][:600] if m['role'] == 'user' else m['content'][:200]}" for m in historial[-4:]
+    )
+    prompt = f"HISTORIAL:\n{contexto}\n\nÚLTIMO MENSAJE:\n{pregunta}"
+    try:
+        r = cliente_gemini.models.generate_content(
+            model=MODELO_GENERACION,
+            contents=prompt,
+            config=GenerateContentConfig(
+                system_instruction=INSTRUCCION_DESCOMPOSITOR,
+                max_output_tokens=400,
+                temperature=0,
+                response_mime_type="application/json",
+            ),
+        )
+        datos = json.loads(re.sub(r"```(?:json)?", "", r.text or "").strip())
+        return [h.strip() for h in datos.get("hechos", []) if isinstance(h, str) and h.strip()][:3]
+    except Exception:
+        return []
 
 
 # ------------------------------------------------------------------
@@ -570,14 +618,22 @@ if pregunta_usuario:
                 cfg = CONFIG_MODOS[modo]
                 st.caption(cfg["etiqueta"])
 
-                # 2. Recuperar contexto según el modo
-                vector_pregunta = obtener_embedding(pregunta_usuario)
+                # 2. Recuperar contexto según el modo (en multa de tráfico: un hecho infractor por consulta)
+                consultas = [pregunta_usuario]
+                hechos = []
+                if modo == "MULTA_TRAFICO":
+                    hechos = descomponer_hechos(pregunta_usuario, historial_previo)
+                    consultas = hechos + [pregunta_usuario]
+                vectores = [obtener_embedding(c) for c in consultas]
                 filtro = construir_filtro(modo, pregunta_usuario)
                 contexto, fragmentos, filtro_usado = buscar_contexto_multi(
-                    [vector_pregunta], top_k=cfg["top_k"], filtro=filtro, modo=modo
+                    vectores, top_k=cfg["top_k"], filtro=filtro, modo=modo,
+                    limite_total=cfg["top_k"] * 2 if len(consultas) > 1 else None,
                 )
                 if MODO_DEBUG:
                     with st.expander(f"🔍 Debug · modo={modo} · filtro={filtro_usado} · {len(fragmentos)} fragmentos"):
+                        if hechos:
+                            st.markdown("**Hechos infractores detectados:** " + " | ".join(hechos))
                         for i, f in enumerate(fragmentos, 1):
                             st.markdown(f"**Fragmento {i}**")
                             st.text(f[:700])
