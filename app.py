@@ -105,7 +105,7 @@ indice_pinecone = obtener_indice_pinecone()
 # Configuración general y ahorro de datos
 # ------------------------------------------------------------------
 MODELO_EMBEDDING = "gemini-embedding-001"
-MODELO_GENERACION = "gemini-3.8-flash"  # O el modelo estándar que utilices
+MODELO_GENERACION = "gemini-3.5-flash"  # O el modelo estándar que utilices
 DIMENSION_EMBEDDING = 768
 VENTANA_HISTORIAL = 4  # Reducido para ahorrar tokens y datos por petición
 LIMITE_INACTIVIDAD = timedelta(minutes=60)
