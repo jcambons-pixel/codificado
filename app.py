@@ -8,6 +8,11 @@ from pathlib import Path
 from PIL import Image
 from datetime import datetime, timedelta
 try:
+    from buscador import construir_indices, buscar_lexico, fusionar
+    BUSCADOR_OK = True
+except ImportError:  # sin buscador.py la app sigue con la búsqueda semántica sola
+    BUSCADOR_OK = False
+try:
     from calculos import cargar_datos, calcular, opciones_dimension_para_prompt
     CALCULOS_OK = True
 except ImportError:  # falta calculos.py junto a app.py: la app sigue funcionando sin calculadoras
@@ -199,6 +204,10 @@ Reglas:
    presenta una lista por cada una, con una ficha del CONTEXTO que encaje exactamente con ese hecho. No añadas
    infracciones hipotéticas que el usuario no haya mencionado. Si para alguna falta un dato (p. ej. si circulaba de noche),
    pregúntalo al final en una frase corta. Si una infracción del caso no tiene ficha en el CONTEXTO, dilo en vez de inventarla.
+8. Si la ficha más cercana es GENÉRICA (p. ej. "en los términos reglamentariamente previstos", "en los casos reglamentarios"),
+   aplícala si el hecho encaja en su sentido general, y avisa en una frase de que el límite o requisito concreto depende del
+   reglamento, que no consta en el CONTEXTO: no lo inventes ni des cifras de memoria. No digas que "no hay ficha" cuando existe
+   una ficha genérica que cubre el hecho.
 
 B) FÓRMULAS Y BAREMOS FIJOS DE VELOCIDAD Y ALCOHOLEMIA:
    - B.1 Corrección de mediciones (etilómetros y radares).
@@ -451,6 +460,16 @@ def obtener_datos_calculo():
 
 DATOS_CALCULO = obtener_datos_calculo()
 
+
+@st.cache_resource
+def obtener_indices_lexicos():
+    if not (BUSCADOR_OK and DATOS_CALCULO):
+        return None
+    return construir_indices(DATOS_CALCULO)
+
+
+INDICES_LEXICOS = obtener_indices_lexicos()
+
 INSTRUCCION_EXTRACTOR = """
 Eres un extractor de datos para calculadoras de denuncias de transporte y tráfico. Lees el HISTORIAL y el ÚLTIMO MENSAJE
 y devuelves SOLO un JSON válido (sin markdown ni texto extra), combinando los datos de TODA la conversación:
@@ -630,6 +649,11 @@ if pregunta_usuario:
                     vectores, top_k=cfg["top_k"], filtro=filtro, modo=modo,
                     limite_total=cfg["top_k"] * 2 if len(consultas) > 1 else None,
                 )
+                if INDICES_LEXICOS and modo in ("MULTA_TRAFICO", "MULTA_TRANSPORTE"):
+                    # Búsqueda por palabras clave: rescata fichas cortas o genéricas que el embedding no encuentra
+                    listas_lex = buscar_lexico(INDICES_LEXICOS, DATOS_CALCULO, modo, consultas, k=3)
+                    fragmentos = fusionar(fragmentos, listas_lex, cfg["top_k"] * 2 + 2)
+                    contexto = "\n\n---\n\n".join(fragmentos)
                 if MODO_DEBUG:
                     with st.expander(f"🔍 Debug · modo={modo} · filtro={filtro_usado} · {len(fragmentos)} fragmentos"):
                         if hechos:
