@@ -1,4 +1,5 @@
 import re
+import json
 import streamlit as st
 from google import genai
 from google.genai.types import HttpOptions, GenerateContentConfig
@@ -6,6 +7,7 @@ from pinecone import Pinecone
 from pathlib import Path
 from PIL import Image
 from datetime import datetime, timedelta
+from calculos import cargar_datos, calcular, opciones_dimension_para_prompt
 
 # ------------------------------------------------------------------
 # Logo del proyecto
@@ -364,6 +366,112 @@ def buscar_contexto(vector_consulta, top_k: int, filtro: dict | None = None, mod
     return "\n\n---\n\n".join(fragmentos), fragmentos, descripcion
 
 
+def buscar_contexto_multi(vectores: list, top_k: int, filtro: dict | None = None, modo: str | None = None):
+    """Busca con varios vectores y une los resultados sin duplicados."""
+    vistos, fragmentos, descripcion = set(), [], None
+    for v in vectores:
+        _, frs, descripcion = buscar_contexto(v, top_k, filtro, modo)
+        for f in frs:
+            if f not in vistos:
+                vistos.add(f)
+                fragmentos.append(f)
+    fragmentos = fragmentos[: top_k * 2]
+    return "\n\n---\n\n".join(fragmentos), fragmentos, descripcion
+
+
+# ------------------------------------------------------------------
+# 5. CÁLCULOS (tiempos de conducción, masas, dimensiones)
+#    La IA solo EXTRAE los datos del relato; Python hace las cuentas y elige la ficha.
+# ------------------------------------------------------------------
+@st.cache_resource
+def obtener_datos_calculo():
+    return cargar_datos()  # None si falta la carpeta datos/ (ver preparar_datos.py)
+
+
+DATOS_CALCULO = obtener_datos_calculo()
+
+INSTRUCCION_EXTRACTOR = """
+Eres un extractor de datos para calculadoras de denuncias de transporte y tráfico. Lees el HISTORIAL y el ÚLTIMO MENSAJE
+y devuelves SOLO un JSON válido (sin markdown ni texto extra), combinando los datos de TODA la conversación:
+{
+ "calculo": "tiempos" | "masas" | "dimensiones" | null,
+ "tiempos": {"eventos": [{"tipo": "conduccion|pausa|descanso", "minutos": entero}], "transporte": "mercancias|viajeros|null", "ampliacion_10h": true|false|null},
+ "masas": {"peso_medido_kg": número|null, "mma_kg": número|null, "margen_bascula": {"valor": número, "unidad": "kg|%"}|null, "peso_ya_neto": true|null, "categoria": "N1|N2|N3|null", "mma_vehiculo_kg": número|null, "regimen": "publico|privado|null", "base": "mma|eje|null"},
+ "dimensiones": {"magnitud": "longitud|anchura|altura|null", "medida_m": número|null, "tipo_vehiculo": clave|null, "modificadores": [claves], "causa_exceso": "carga_indivisible|caracteristica_tecnica|otra|null", "autorizacion": "sin_autorizacion|incumple_condiciones|con_autorizacion_cumple|null"}
+}
+Reglas:
+- "calculo" es null si el último mensaje es una pregunta general o no hay un caso concreto con cifras. Si el último mensaje solo
+  completa datos que faltaban de un cálculo anterior del historial, mantén ese cálculo.
+- Nunca inventes datos: lo que no se haya dicho va a null (o [] en eventos).
+- TIEMPOS: convierte todo a minutos (4,5 h = 270; 13 h 30 = 810). Respeta el orden del relato. "descanso" = 9 horas o más; "pausa" = interrupción más corta.
+  "transporte": mercancias (camión, carga) o viajeros (autobús, autocar). "ampliacion_10h": true solo si se dice que puede ampliar o ha ampliado a 10 h; false si se dice que rige el límite de 9 h.
+- MASAS: pesos en kg (1 t = 1000 kg). "mma_kg" es la MMA de la ficha técnica o de la autorización especial (la del eje si el exceso es por eje). "regimen": publico (transporte público, con autorización de transporte) o privado (privado complementario).
+  "base": "eje" si el exceso es de un eje, "mma" si es de la masa total. "peso_ya_neto": true si dicen que ya está descontado el margen o tolerancia de la báscula.
+- DIMENSIONES: medidas en metros. "tipo_vehiculo" debe ser UNA de estas claves (o null si no está claro):
+{{OPCIONES}}
+  "causa_exceso": carga_indivisible, caracteristica_tecnica u otra (p. ej. carga divisible). "autorizacion": estado de la autorización especial o complementaria.
+"""
+INSTRUCCION_EXTRACTOR = INSTRUCCION_EXTRACTOR.replace("{{OPCIONES}}", opciones_dimension_para_prompt())
+
+RE_CALCULO = re.compile(
+    r"conduc|descans|paus|horas|minutos|tac[óo]graf|peso|pesa|kg|kilo|tonelad|\bt\b|mma|\beje|altur|\balto|anch|larg|longitud|metros|\bm\b",
+    re.I,
+)
+
+
+def parece_calculo(pregunta: str, calculo_reciente: bool) -> bool:
+    if calculo_reciente:  # el mensaje puede completar o variar el cálculo anterior ("público", "sin autorización"...)
+        return True
+    return bool(re.search(r"\d", pregunta)) and bool(RE_CALCULO.search(pregunta))
+
+
+def extraer_calculo(pregunta: str, historial: list):
+    contexto = "\n".join(
+        f"{m['role']}: {m['content'][:1000] if m['role'] == 'user' else m['content'][:300]}" for m in historial[-6:]
+    )
+    prompt = f"HISTORIAL:\n{contexto}\n\nÚLTIMO MENSAJE:\n{pregunta}"
+    try:
+        r = cliente_gemini.models.generate_content(
+            model=MODELO_GENERACION,
+            contents=prompt,
+            config=GenerateContentConfig(
+                system_instruction=INSTRUCCION_EXTRACTOR,
+                max_output_tokens=1500,
+                temperature=0,
+                response_mime_type="application/json",
+            ),
+        )
+        bruto = re.sub(r"```(?:json)?", "", r.text or "").strip()
+        return json.loads(bruto)
+    except Exception:
+        return None
+
+
+INSTRUCCION_CALCULO = REGLAS_COMUNES + """
+MODO CÁLCULO. Recibes un bloque "RESULTADO DEL CÁLCULO" ya verificado por código.
+Reglas:
+1. NO recalcules ni cambies cifras. No inventes fichas, artículos, importes, puntos ni inmovilizaciones: usa solo lo que está en el bloque.
+2. Si el bloque contiene "FALTAN DATOS": pregunta SOLO por esos datos, en una o dos frases cortas, y NO des ninguna sanción.
+3. Empieza con una línea "Cálculo:" que resuma las cifras clave del bloque.
+4. Fichas de TRANSPORTE: preséntalas con esta lista, una línea por punto:
+   - Código: ...
+   - Concepto: ...
+   - Norma infringida: ...
+   - Norma sancionadora: ...
+   - Cuantía: ... (solo el importe)
+   - Inmovilización: Sí (art. ...) / No consta   (sácalo de "Cuantía y medidas")
+   - Responsable: ... (solo si la ficha lo indica; si no, "No consta")
+   No menciones puntos del carné en transporte.
+5. Fichas de TRÁFICO: preséntalas tal cual vienen (Norma y artículo / Infracción resumida / Calificación / Cuantía / Puntos / Responsable / Comentario resumido).
+6. Si hay varias alternativas porque falta un dato, preséntalas todas de forma breve y termina preguntando SOLO lo que indique "PREGUNTAS PENDIENTES".
+7. Si hay AVISOS que afecten a la decisión (porcentaje deducido, campos cortados, cercanía al umbral, criterio dudoso), inclúyelos al final en una línea.
+"""
+CONFIG_MODOS["CALCULO"] = {
+    "prompt": INSTRUCCION_CALCULO, "top_k": 0, "max_tokens": 1800,
+    "temp": 0.1, "etiqueta": "🧮 Cálculo",
+}
+
+
 # ------------------------------------------------------------------
 # Interfaz visual de Chat
 # ------------------------------------------------------------------
@@ -382,15 +490,18 @@ if "ultima_interaccion" not in st.session_state:
 
 if datetime.now() - st.session_state.ultima_interaccion > LIMITE_INACTIVIDAD:
     st.session_state.mensajes = []
+    st.session_state.calculo_reciente = False
 
 st.session_state.ultima_interaccion = datetime.now()
 
 with st.sidebar:
     if st.button("🗑️ Nueva conversación"):
         st.session_state.mensajes = []
+        st.session_state.calculo_reciente = False
         st.rerun()
     st.caption(f"Filtros por metadatos: {'ON' if USAR_FILTROS_METADATOS else 'OFF'}")
     st.caption(f"Debug: {'ON' if MODO_DEBUG else 'OFF'}")
+    st.caption("Calculadoras: ON" if DATOS_CALCULO else "Calculadoras: OFF (falta la carpeta datos/)")
 
 for mensaje in st.session_state.mensajes:
     avatar = AVATAR_ASISTENTE if mensaje["role"] == "assistant" else None
@@ -410,28 +521,49 @@ if pregunta_usuario:
         texto_acumulado = ""
 
         try:
-            # 0. Clasificar (si hay código SG, es transporte seguro)
-            if detectar_codigo(pregunta_usuario):
-                modo = "MULTA_TRANSPORTE"
+            # 0. ¿Es un cálculo (tiempos, masas, dimensiones)? La IA extrae, Python calcula.
+            resultado_calculo = {"estado": "sin_calculo", "texto": "", "etiqueta": ""}
+            extraccion = None
+            if DATOS_CALCULO and parece_calculo(pregunta_usuario, st.session_state.get("calculo_reciente", False)):
+                extraccion = extraer_calculo(pregunta_usuario, historial_previo)
+                if extraccion:
+                    resultado_calculo = calcular(extraccion, DATOS_CALCULO)
+
+            if resultado_calculo["estado"] != "sin_calculo":
+                modo = "CALCULO"
+                cfg = CONFIG_MODOS[modo]
+                st.session_state.calculo_reciente = True
+                texto_calc = resultado_calculo["texto"]
+                st.caption(resultado_calculo["etiqueta"])
+                if MODO_DEBUG:
+                    with st.expander("🔍 Debug · cálculo"):
+                        st.markdown("**Datos extraídos por la IA**")
+                        st.json(extraccion)
+                        st.markdown("**Resultado del cálculo (lo que recibe el modelo)**")
+                        st.text(texto_calc)
+                prompt_actual = f"{texto_calc}\n\nPREGUNTA:\n{pregunta_usuario}"
             else:
-                modo = clasificar_consulta(pregunta_usuario, historial_previo)
-            cfg = CONFIG_MODOS[modo]
-            st.caption(cfg["etiqueta"])
+                st.session_state.calculo_reciente = False
+                # 1. Clasificar (si hay código de transporte tipo SG01.01, es transporte seguro)
+                if detectar_codigo(pregunta_usuario):
+                    modo = "MULTA_TRANSPORTE"
+                else:
+                    modo = clasificar_consulta(pregunta_usuario, historial_previo)
+                cfg = CONFIG_MODOS[modo]
+                st.caption(cfg["etiqueta"])
 
-            # 1. Recuperar contexto según el modo
-            vector_pregunta = obtener_embedding(pregunta_usuario)
-            filtro = construir_filtro(modo, pregunta_usuario)
-            contexto, fragmentos, filtro_usado = buscar_contexto(
-                vector_pregunta, top_k=cfg["top_k"], filtro=filtro, modo=modo
-            )
-
-            if MODO_DEBUG:
-                with st.expander(f"🔍 Debug · modo={modo} · filtro={filtro_usado} · {len(fragmentos)} fragmentos"):
-                    for i, f in enumerate(fragmentos, 1):
-                        st.markdown(f"**Fragmento {i}**")
-                        st.text(f[:700])
-
-            prompt_actual = f"CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta_usuario}"
+                # 2. Recuperar contexto según el modo
+                vector_pregunta = obtener_embedding(pregunta_usuario)
+                filtro = construir_filtro(modo, pregunta_usuario)
+                contexto, fragmentos, filtro_usado = buscar_contexto_multi(
+                    [vector_pregunta], top_k=cfg["top_k"], filtro=filtro, modo=modo
+                )
+                if MODO_DEBUG:
+                    with st.expander(f"🔍 Debug · modo={modo} · filtro={filtro_usado} · {len(fragmentos)} fragmentos"):
+                        for i, f in enumerate(fragmentos, 1):
+                            st.markdown(f"**Fragmento {i}**")
+                            st.text(f[:700])
+                prompt_actual = f"CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta_usuario}"
 
             # 1b. Historial conversacional
             mensajes_previos = historial_previo[-VENTANA_HISTORIAL:]
