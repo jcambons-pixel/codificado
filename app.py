@@ -3,7 +3,7 @@ import json
 import time
 import threading
 import streamlit as st
-from collections import deque
+from collections import deque, Counter
 from google import genai
 from google.genai.types import HttpOptions, GenerateContentConfig
 from pinecone import Pinecone
@@ -106,39 +106,55 @@ indice_pinecone = obtener_indice_pinecone()
 # ------------------------------------------------------------------
 MODELO_EMBEDDING = "gemini-embedding-001"
 MODELO_GENERACION = "gemini-3.5-flash-lite"
+MODELO_ANALISIS = MODELO_GENERACION  # clasificar + extraer datos; puede ser otro modelo si quieres repartir cuota
 DIMENSION_EMBEDDING = 768
 VENTANA_HISTORIAL = 8
 LIMITE_INACTIVIDAD = timedelta(minutes=60)
-MAX_RPM = 12  # peticiones a Gemini por minuto que se permite la app (la cuota real es 15)
+
+# Cuota de Gemini: los límites son POR MODELO (compruébalos en Google AI Studio > Rate limits).
+# Cada modelo tiene su propio contador aquí, así los embeddings ya no gastan el cupo de generación.
+MAX_RPM = 12               # peticiones/min a modelos de generación (la cuota real es 15)
+MAX_RPM_EMBEDDING = 60     # peticiones/min al modelo de embeddings (cupo propio y mucho mayor)
+LIMITE_RPM = {MODELO_GENERACION: MAX_RPM, MODELO_EMBEDDING: MAX_RPM_EMBEDDING}
+LIMITE_RPM.setdefault(MODELO_ANALISIS, MAX_RPM)
+
+# En "Resto de infracciones" forzado, separar el caso en hechos infractores cuesta 1 llamada extra.
+# En automático NO cuesta nada, porque lo hace el mismo análisis que clasifica.
+DESCOMPONER_EN_MODO_FORZADO = False
 
 # Filtros por metadatos en Pinecone.
 # Déjalo en False hasta que hayas añadido los campos "fuente" (trafico/transporte),
 # "codigo" (transporte) y "articulo" (tráfico, como número) a tus vectores.
-# Si está en True y el filtro no devuelve nada, se reintenta sin filtro automáticamente.
 USAR_FILTROS_METADATOS = False
-MODO_DEBUG = True  # muestra modo detectado, filtro usado y fragmentos recuperados
+MODO_DEBUG = True  # muestra modo detectado, filtro usado, fragmentos recuperados y nº de llamadas
 
 # ------------------------------------------------------------------
-# 0. LIMITADOR DE PETICIONES Y REINTENTOS (cuota de Gemini: 15 RPM)
+# 0. LIMITADOR DE PETICIONES Y REINTENTOS
 #    Todas las llamadas a Gemini (generación y embeddings) pasan por aquí.
-#    El contador es global: se comparte entre todas las sesiones de la app.
+#    El contador es global (se comparte entre todas las sesiones) y va por modelo.
 # ------------------------------------------------------------------
+LLAMADAS_CONSULTA = []  # se vacía en cada ejecución del script (una por mensaje): sirve para el debug
+
+
 @st.cache_resource
 def _estado_limitador():
-    return {"lock": threading.Lock(), "llamadas": deque()}
+    return {"lock": threading.Lock(), "llamadas": {}}
 
 
-def esperar_turno():
+def esperar_turno(modelo: str):
     est = _estado_limitador()
+    limite = LIMITE_RPM.get(modelo, MAX_RPM)
     while True:
         with est["lock"]:
+            cola = est["llamadas"].setdefault(modelo, deque())
             ahora = time.time()
-            while est["llamadas"] and ahora - est["llamadas"][0] > 60:
-                est["llamadas"].popleft()
-            if len(est["llamadas"]) < MAX_RPM:
-                est["llamadas"].append(ahora)
+            while cola and ahora - cola[0] > 60:
+                cola.popleft()
+            if len(cola) < limite:
+                cola.append(ahora)
+                LLAMADAS_CONSULTA.append(modelo)
                 return
-            espera = 60 - (ahora - est["llamadas"][0]) + 0.2
+            espera = 60 - (ahora - cola[0]) + 0.2
         time.sleep(max(espera, 0.2))
 
 
@@ -147,9 +163,9 @@ def es_error_cuota(error) -> bool:
     return "429" in texto or "RESOURCE_EXHAUSTED" in texto
 
 
-def con_reintentos(funcion, intentos: int = 3):
+def con_reintentos(funcion, modelo: str, intentos: int = 3):
     for i in range(intentos):
-        esperar_turno()
+        esperar_turno(modelo)
         try:
             return funcion()
         except Exception as e:
@@ -160,13 +176,13 @@ def con_reintentos(funcion, intentos: int = 3):
 
 
 def llamar_gemini(**kwargs):
-    return con_reintentos(lambda: cliente_gemini.models.generate_content(**kwargs))
+    return con_reintentos(lambda: cliente_gemini.models.generate_content(**kwargs), kwargs["model"])
 
 
 def generar_stream(**kwargs):
     """Streaming con limitador; reintenta solo si falla antes de emitir el primer fragmento."""
     for intento in range(3):
-        esperar_turno()
+        esperar_turno(kwargs["model"])
         emitido = False
         try:
             for chunk in cliente_gemini.models.generate_content_stream(**kwargs):
@@ -191,6 +207,29 @@ def obtener_datos_calculo():
 
 DATOS_CALCULO = obtener_datos_calculo()
 
+
+def _leer_referencia_inmovilizacion():
+    try:
+        return (Path(__file__).parent / "datos" / "ref_inmovilizacion.txt").read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+REFERENCIA_INMOVILIZACION = _leer_referencia_inmovilizacion()
+def _leer_referencia_penal():
+    try:
+        return (Path(__file__).parent / "datos" / "ref_penal.txt").read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+REFERENCIA_PENAL = _leer_referencia_penal()
+RE_PENAL = re.compile(
+    r"km/?h|velocid|radar|cinem[oó]metro|alcohol|tasa|mg/?l|etil[oó]metro|droga|temerari|kamikaze|negativ|soplar|delito|c[oó]digo penal|\b38[0-3]\b|\b379\b",
+    re.I,
+)
+RE_CONSECUENCIA = re.compile(r"inmoviliz|retirad|dep[óo]sito|gr[úu]a|gastos", re.I)
+
 CLAVES_CODIGO = ("codigo", "código", "code", "cod")
 
 
@@ -210,6 +249,8 @@ def extraer_codigos_transporte(datos) -> list:
     """Recoge los códigos reales del baremo de transporte, sea cual sea su formato.
     Asume que, en el JSON de datos/, las fichas de transporte cuelgan de una clave que contiene
     'transporte' y que cada ficha tiene un campo 'codigo'. Ajusta CLAVES_CODIGO si se llama distinto."""
+    if isinstance(datos, dict) and isinstance(datos.get("baremo"), dict) and datos["baremo"].get("fichas"):
+        return sorted(datos["baremo"]["fichas"].keys())  # formato generado por preparar_datos.py
     salida = set()
     if datos:
         try:
@@ -233,10 +274,10 @@ CODIGOS_TRANSPORTE = extraer_codigos_transporte(DATOS_CALCULO)
 RE_CODIGO_TRANSPORTE = construir_regex_codigos(CODIGOS_TRANSPORTE)
 
 # ------------------------------------------------------------------
-# 1. PLANIFICADOR: clasifica la consulta y, si es multa de tráfico, la descompone en hechos
-#    (una sola llamada a Gemini en lugar de dos)
+# 1. ANÁLISIS: una sola llamada que clasifica la consulta, descompone el caso en hechos
+#    infractores y, si hace falta, extrae los datos para las calculadoras.
 # ------------------------------------------------------------------
-INSTRUCCION_PLANIFICADOR = """
+PLAN_BASE = """
 Clasifica la ÚLTIMA consulta del usuario en UNA de estas categorías:
 
 MULTA_TRAFICO: el usuario quiere saber la sanción, cuantía, puntos, precepto o infracción concreta de un hecho de TRÁFICO
@@ -250,6 +291,8 @@ CONSULTA_GENERAL: pregunta conceptual o de conocimiento sobre una norma (qué di
 
 Usa el historial para entender mensajes cortos de seguimiento (ej. "¿y si es reincidente?" hereda el modo anterior).
 Si dudas entre multa y general, elige CONSULTA_GENERAL salvo que pidan expresamente cuantía, puntos, artículo o "qué multa pone".
+Las preguntas sobre las CONSECUENCIAS de un caso concreto (¿procede inmovilizar?, ¿cuántos puntos?, ¿retirada del vehículo?)
+son de multa, no CONSULTA_GENERAL.
 
 Además, si la categoría es MULTA_TRAFICO, descompón el caso en los HECHOS INFRACTORES que podrían denunciarse, cada uno
 redactado como lo escribiría el baremo de la DGT en su campo "Hecho infringido" (lenguaje formal:
@@ -259,27 +302,72 @@ redactado como lo escribiría el baremo de la DGT en su campo "Hecho infringido"
   (p. ej. matrícula tapada, circulación nocturna) si no se han mencionado.
 - Si el mensaje es una pregunta de conocimiento y no un caso concreto, "hechos": [].
 En cualquier otra categoría, "hechos": [].
+"""
 
+INSTRUCCION_PLANIFICADOR = PLAN_BASE + """
 Responde SOLO con JSON válido, sin markdown: {"modo": "<ETIQUETA>", "hechos": ["...", "..."]}
 """
+
+EXTRACCION_REGLAS = """
+ADEMÁS, extrae los datos para las calculadoras (tiempos de conducción, masas, dimensiones, cargas que sobresalen),
+combinando los datos de TODA la conversación. Estructura:
+{
+ "calculo": "tiempos" | "masas" | "dimensiones" | "cargas" | "velocidad" | null,
+ "tiempos": {"eventos": [{"tipo": "conduccion|pausa|descanso", "minutos": entero}], "transporte": "mercancias|viajeros|null", "ampliacion_10h": true|false|null},
+ "masas": {"peso_medido_kg": número|null, "mma_kg": número|null, "margen_bascula": {"valor": número, "unidad": "kg|%"}|null, "peso_ya_neto": true|null, "categoria": "N1|N2|N3|null", "mma_vehiculo_kg": número|null, "regimen": "publico|privado|null", "base": "mma|eje|null"},
+ "dimensiones": {"magnitud": "longitud|anchura|altura|null", "medida_m": número|null, "tipo_vehiculo": clave|null, "modificadores": [claves], "causa_exceso": "carga_indivisible|caracteristica_tecnica|otra|null", "autorizacion": "sin_autorizacion|incumple_condiciones|con_autorizacion_cumple|null"},
+ "velocidad": {"velocidad_medida_kmh": número|null, "limite_kmh": número|null, "via": "urbana|interurbana|travesia|null", "velocidad_corregida_kmh": número|null, "cinemometro": "fijo|movil|tramo|null", "radar_nuevo": true|null, "limite_origen": "senalizado|generico|null"},
+ "cargas": {"vehiculo_exclusivo_mercancias": true|false|null, "longitud_vehiculo_m": número|null, "ancho_vehiculo_m": número|null, "ancho_total_m": número|null, "direccion": "detras|delante|lateral|null", "sobresale_m": número|null, "indivisible": true|false|null, "tipo_carga": "longitud_indivisible|otra|null", "senal_v20": true|false|null, "luz": true|false|null, "visibilidad_reducida": true|false|null, "transporte_especial": true|false|null}
+}
+Reglas de extracción:
+- "calculo" es null salvo que el último mensaje describa un EXCESO o un caso que se resuelva con estas calculadoras. Un dato que solo
+  describe el vehículo (p. ej. "camión de 7.500 kg", "furgoneta de 3 m de largo") NO es un cálculo. Si el último mensaje solo completa
+  datos que faltaban de un cálculo anterior del historial, mantén ese cálculo. En cualquier otro caso, "calculo": null.
+- Nunca inventes datos: lo que no se haya dicho va a null (o [] en eventos).
+- TIEMPOS: convierte todo a minutos (4,5 h = 270; 13 h 30 = 810). Respeta el orden del relato. "descanso" = 9 horas o más; "pausa" = interrupción más corta.
+  "transporte": mercancias (camión, carga) o viajeros (autobús, autocar). "ampliacion_10h": true solo si se dice que puede ampliar o ha ampliado a 10 h; false si se dice que rige el límite de 9 h.
+- MASAS: pesos en kg (1 t = 1000 kg). "mma_kg" es la MMA de la ficha técnica o de la autorización especial (la del eje si el exceso es por eje). "regimen": publico (transporte público, con autorización de transporte) o privado (privado complementario).
+  "base": "eje" si el exceso es de un eje, "mma" si es de la masa total. "peso_ya_neto": true si dicen que ya está descontado el margen o tolerancia de la báscula.
+- DIMENSIONES: medidas en metros. "tipo_vehiculo" debe ser UNA de estas claves (o null si no está claro):
+{{OPCIONES}}
+  "causa_exceso": carga_indivisible, caracteristica_tecnica u otra (p. ej. carga divisible). "autorizacion": estado de la autorización especial o complementaria.
+- VELOCIDAD: úsala solo si se da una velocidad medida Y el límite de la vía. "via": urbana, interurbana o travesia (tramo de carretera que cruza un núcleo urbano); null si no se dice.
+  "velocidad_corregida_kmh" solo si dicen que ya se ha restado el margen del cinemómetro.
+  "cinemometro": fijo (radar fijo), movil (radar móvil, instalado en vehículo o de mano) o tramo (velocidad media entre dos puntos); null si no se dice.
+  "radar_nuevo": true solo si dicen que el radar es nuevo o está en su primer año de uso tras la verificación; en cualquier otro caso null.
+  "limite_origen": "senalizado" si dicen que el límite lo fija una señal (vertical, marcas viales, panel) o es una limitación específica de un vehículo o de un conductor;
+  "generico" si dicen que es el límite genérico de la vía (sin señal específica); null si no lo dicen.
+- CARGAS vs DIMENSIONES: una carga que SOBRESALE del vehículo (tabla de surf, barra, viga, bultos fuera de su proyección) es "cargas", NUNCA "dimensiones".
+  "dimensiones" es solo para el largo, ancho o alto TOTAL del vehículo o conjunto (con su carga). Si no sabes si una medida es la longitud del vehículo o lo que sobresale, no la pongas en "dimensiones".
+- CARGAS (art. 15 RGC): "vehiculo_exclusivo_mercancias": true para camión o vehículo de carga; false para turismo y vehículos mixtos o de uso particular; null si no queda claro.
+  "indivisible": true si la carga no puede dividirse (tabla de surf, barra, viga, tubo), false si son bultos divisibles. "tipo_carga": longitud_indivisible (vigas, postes, tubos) u otra.
+  "senal_v20": true solo si lleva el panel V-20 reglamentario; false si no lleva señal o lleva otra cosa (pañuelo, trapo, cinta). "luz": true si lleva luz roja detrás o blanca delante.
+  "visibilidad_reducida": true si circula entre la puesta y la salida del sol o con niebla o lluvia intensa; false si es de día con buena visibilidad.
+"""
+INSTRUCCION_ANALISIS = (
+    PLAN_BASE
+    + EXTRACCION_REGLAS.replace("{{OPCIONES}}", opciones_dimension_para_prompt())
+    + '\nResponde SOLO con JSON válido, sin markdown, con las claves "modo", "hechos", "calculo", "tiempos", "masas", "dimensiones" y "cargas".\n'
+)
 
 MODOS_VALIDOS = ("MULTA_TRAFICO", "MULTA_TRANSPORTE", "CONSULTA_GENERAL")
 
 
-def planificar(pregunta: str, historial: list):
-    """Devuelve (modo, hechos). Una sola llamada a Gemini."""
+def analizar(pregunta: str, historial: list, con_calculo: bool):
+    """Devuelve (modo, hechos, extraccion). UNA sola llamada a Gemini.
+    Si no hay posibilidad de cálculo se usa el prompt corto (solo clasificación y hechos)."""
     contexto_previo = "\n".join(
-        f"{m['role']}: {m['content'][:600] if m['role'] == 'user' else m['content'][:300]}"
-        for m in historial[-4:]
+        f"{m['role']}: {m['content'][:1000] if m['role'] == 'user' else m['content'][:300]}"
+        for m in historial[-6:]
     )
     prompt = f"HISTORIAL RECIENTE:\n{contexto_previo}\n\nÚLTIMA CONSULTA:\n{pregunta}"
     try:
         r = llamar_gemini(
-            model=MODELO_GENERACION,
+            model=MODELO_ANALISIS,
             contents=prompt,
             config=GenerateContentConfig(
-                system_instruction=INSTRUCCION_PLANIFICADOR,
-                max_output_tokens=400,
+                system_instruction=INSTRUCCION_ANALISIS if con_calculo else INSTRUCCION_PLANIFICADOR,
+                max_output_tokens=1500 if con_calculo else 400,
                 temperature=0,
                 response_mime_type="application/json",
             ),
@@ -289,9 +377,9 @@ def planificar(pregunta: str, historial: list):
         if modo not in MODOS_VALIDOS:
             modo = "CONSULTA_GENERAL"
         hechos = [h.strip() for h in datos.get("hechos", []) if isinstance(h, str) and h.strip()][:3]
-        return modo, (hechos if modo == "MULTA_TRAFICO" else [])
+        return modo, (hechos if modo == "MULTA_TRAFICO" else []), (datos if con_calculo else None)
     except Exception:
-        return "CONSULTA_GENERAL", []
+        return "CONSULTA_GENERAL", [], None
 
 
 # ------------------------------------------------------------------
@@ -321,8 +409,9 @@ Reglas:
 2. Si ninguna ficha encaja claramente, dilo y no inventes artículo, opción, importe ni puntos.
 3. VMP/VPL: si faltan datos críticos (peso, fecha de comercialización, certificado, registro, etiqueta),
    PROHIBIDO dar sanción definitiva; pregunta por ellos en una sola frase corta.
-4. Velocidad/radar y alcohol/drogas: si falta algún dato (valor medido, tipo de vía, límite, tipo de conductor...),
-   pregunta antes de calcular.
+4. Velocidad/radar y alcohol/drogas: pregunta SOLO por lo que falte de verdad (velocidad o tasa medida, límite de la vía,
+   tipo de cinemómetro o etilómetro, tipo de conductor). No preguntes datos que no cambien la ficha: por ejemplo, el tipo de vía
+   si ya te dan el límite.
 5. El campo Comentario úsalo solo si es relevante para el caso (posible delito, compatibilidad con otros
    expedientes, aclaraciones de aplicación). Resúmelo; no lo copies entero.
 6. Con la ficha identificada, responde SIEMPRE en esta lista, una línea por punto:
@@ -342,6 +431,16 @@ Reglas:
    aplícala si el hecho encaja en su sentido general, y avisa en una frase de que el límite o requisito concreto depende del
    reglamento, que no consta en el CONTEXTO: no lo inventes ni des cifras de memoria. No digas que "no hay ficha" cuando existe
    una ficha genérica que cubre el hecho.
+9. CONSECUENCIAS (inmovilización, retirada, depósito, gastos): responde solo si preguntan por ellas. Primero identifica la infracción
+   y da su ficha; después usa el bloque NORMA DE REFERENCIA del CONTEXTO y cita la letra del art. 104.1 (o del 105.1) que encaje. Si la
+   ficha o su comentario ya dicen algo, úsalo. Si ninguna letra encaja, di "no consta" y no la inventes. Si depende de un dato que falta
+   (p. ej. la clase de permiso que exige el vehículo o la que posee el conductor), pregúntalo en una frase. Para la letra k aplica los
+   criterios del bloque de referencia (C1 y D1 también; no se inmoviliza si posee C1 o D1 cuando se exige C o D, ni si el permiso adecuado está caducado).
+10. VELOCIDAD, ALCOHOL, DROGAS: si el CONTEXTO incluye la NORMA DE REFERENCIA PENAL, úsala para decidir si el hecho es delito o infracción
+    administrativa ANTES de dar una multa; si es presunto delito, indícalo en lugar de una multa. Las opciones de la ficha del art. 52
+    (5A, 5E, 5G, 5I...) dependen del exceso sobre el límite DESPUÉS de restar el margen del cinemómetro: aplica margen y tabla de excesos
+    SOLO si figuran en el CONTEXTO o en el bloque B; si no figuran, dilo en una frase y NO elijas una opción al azar ni des cuantía.
+    No preguntes por el margen si no consta: indica que debe aplicarse el EMP del certificado del equipo.
 
 B) FÓRMULAS Y BAREMOS FIJOS DE VELOCIDAD Y ALCOHOLEMIA:
    - B.1 Corrección de mediciones (etilómetros y radares).
@@ -510,7 +609,8 @@ def obtener_embeddings(textos: list):
                 model=MODELO_EMBEDDING,
                 contents=faltan,
                 config={"output_dimensionality": DIMENSION_EMBEDDING},
-            )
+            ),
+            MODELO_EMBEDDING,
         )
         for texto, emb in zip(faltan, r.embeddings):
             cache[texto] = emb.values
@@ -586,9 +686,8 @@ def buscar_contexto_multi(vectores: list, top_k: int, filtro: dict | None = None
 
 
 # ------------------------------------------------------------------
-# 4b. Descomposición de casos de tráfico en hechos infractores
-#     En modo automático lo hace el planificador (una sola llamada).
-#     Esta función se usa cuando el usuario fuerza "Resto de infracciones".
+# 4b. Descomposición de casos de tráfico en hechos infractores (solo si se fuerza
+#     "Resto de infracciones" Y DESCOMPONER_EN_MODO_FORZADO está activo)
 # ------------------------------------------------------------------
 INSTRUCCION_DESCOMPOSITOR = """
 Eres un asistente de denuncias de tráfico en España. Descompón el caso del ÚLTIMO MENSAJE en los HECHOS INFRACTORES
@@ -609,7 +708,7 @@ def descomponer_hechos(pregunta: str, historial: list) -> list:
     prompt = f"HISTORIAL:\n{contexto}\n\nÚLTIMO MENSAJE:\n{pregunta}"
     try:
         r = llamar_gemini(
-            model=MODELO_GENERACION,
+            model=MODELO_ANALISIS,
             contents=prompt,
             config=GenerateContentConfig(
                 system_instruction=INSTRUCCION_DESCOMPOSITOR,
@@ -625,8 +724,9 @@ def descomponer_hechos(pregunta: str, historial: list) -> list:
 
 
 # ------------------------------------------------------------------
-# 5. CÁLCULOS (tiempos de conducción, masas, dimensiones)
-#    La IA solo EXTRAE los datos del relato; Python hace las cuentas y elige la ficha.
+# 5. CÁLCULOS (tiempos de conducción, masas, dimensiones, cargas)
+#    La IA solo EXTRAE los datos del relato (en la misma llamada del análisis);
+#    Python hace las cuentas y elige la ficha.
 # ------------------------------------------------------------------
 @st.cache_resource
 def obtener_indices_lexicos():
@@ -637,31 +737,8 @@ def obtener_indices_lexicos():
 
 INDICES_LEXICOS = obtener_indices_lexicos()
 
-INSTRUCCION_EXTRACTOR = """
-Eres un extractor de datos para calculadoras de denuncias de transporte y tráfico. Lees el HISTORIAL y el ÚLTIMO MENSAJE
-y devuelves SOLO un JSON válido (sin markdown ni texto extra), combinando los datos de TODA la conversación:
-{
- "calculo": "tiempos" | "masas" | "dimensiones" | null,
- "tiempos": {"eventos": [{"tipo": "conduccion|pausa|descanso", "minutos": entero}], "transporte": "mercancias|viajeros|null", "ampliacion_10h": true|false|null},
- "masas": {"peso_medido_kg": número|null, "mma_kg": número|null, "margen_bascula": {"valor": número, "unidad": "kg|%"}|null, "peso_ya_neto": true|null, "categoria": "N1|N2|N3|null", "mma_vehiculo_kg": número|null, "regimen": "publico|privado|null", "base": "mma|eje|null"},
- "dimensiones": {"magnitud": "longitud|anchura|altura|null", "medida_m": número|null, "tipo_vehiculo": clave|null, "modificadores": [claves], "causa_exceso": "carga_indivisible|caracteristica_tecnica|otra|null", "autorizacion": "sin_autorizacion|incumple_condiciones|con_autorizacion_cumple|null"}
-}
-Reglas:
-- "calculo" es null si el último mensaje es una pregunta general o no hay un caso concreto con cifras. Si el último mensaje solo
-  completa datos que faltaban de un cálculo anterior del historial, mantén ese cálculo.
-- Nunca inventes datos: lo que no se haya dicho va a null (o [] en eventos).
-- TIEMPOS: convierte todo a minutos (4,5 h = 270; 13 h 30 = 810). Respeta el orden del relato. "descanso" = 9 horas o más; "pausa" = interrupción más corta.
-  "transporte": mercancias (camión, carga) o viajeros (autobús, autocar). "ampliacion_10h": true solo si se dice que puede ampliar o ha ampliado a 10 h; false si se dice que rige el límite de 9 h.
-- MASAS: pesos en kg (1 t = 1000 kg). "mma_kg" es la MMA de la ficha técnica o de la autorización especial (la del eje si el exceso es por eje). "regimen": publico (transporte público, con autorización de transporte) o privado (privado complementario).
-  "base": "eje" si el exceso es de un eje, "mma" si es de la masa total. "peso_ya_neto": true si dicen que ya está descontado el margen o tolerancia de la báscula.
-- DIMENSIONES: medidas en metros. "tipo_vehiculo" debe ser UNA de estas claves (o null si no está claro):
-{{OPCIONES}}
-  "causa_exceso": carga_indivisible, caracteristica_tecnica u otra (p. ej. carga divisible). "autorizacion": estado de la autorización especial o complementaria.
-"""
-INSTRUCCION_EXTRACTOR = INSTRUCCION_EXTRACTOR.replace("{{OPCIONES}}", opciones_dimension_para_prompt())
-
 RE_CALCULO = re.compile(
-    r"conduc|descans|paus|horas|minutos|tac[óo]graf|peso|pesa|kg|kilo|tonelad|\bt\b|mma|\beje|altur|\balto|anch|larg|longitud|metros|\bm\b",
+    r"conduc|descans|paus|horas|minutos|tac[óo]graf|peso|pesa|kg|kilo|tonelad|\bt\b|mma|\beje|altur|\balto|anch|larg|longitud|metros|\bm\b|sobresal|baca|km/?h|velocid|radar|cinem",
     re.I,
 )
 
@@ -675,26 +752,16 @@ def parece_calculo(pregunta: str, calculo_reciente: bool) -> bool:
     return tiene_cifras and bool(RE_CALCULO.search(pregunta))
 
 
-def extraer_calculo(pregunta: str, historial: list):
-    contexto = "\n".join(
-        f"{m['role']}: {m['content'][:1000] if m['role'] == 'user' else m['content'][:300]}" for m in historial[-6:]
-    )
-    prompt = f"HISTORIAL:\n{contexto}\n\nÚLTIMO MENSAJE:\n{pregunta}"
-    try:
-        r = llamar_gemini(
-            model=MODELO_GENERACION,
-            contents=prompt,
-            config=GenerateContentConfig(
-                system_instruction=INSTRUCCION_EXTRACTOR,
-                max_output_tokens=1500,
-                temperature=0,
-                response_mime_type="application/json",
-            ),
-        )
-        bruto = re.sub(r"```(?:json)?", "", r.text or "").strip()
-        return json.loads(bruto)
-    except Exception:
-        return None
+def texto_faltan(texto_calc: str) -> str:
+    """Pregunta directa (sin llamar al modelo) cuando a la calculadora le faltan datos."""
+    m = re.search(r"FALTAN DATOS: (.*)", texto_calc)
+    items = [x.strip() for x in (m.group(1).split(";") if m else []) if x.strip()]
+    conocidos = re.search(r"Datos ya conocidos: (.*)", texto_calc)
+    lineas = [f"Para calcularlo necesito {'este dato' if len(items) == 1 else 'estos datos'}:"]
+    lineas += [f"- {x[0].upper() + x[1:]}" for x in items]
+    if conocidos:
+        lineas.append(f"\n(Ya tengo: {conocidos.group(1)}.)")
+    return "\n".join(lineas)
 
 
 INSTRUCCION_CALCULO = REGLAS_COMUNES + """
@@ -715,6 +782,9 @@ Reglas:
 5. Fichas de TRÁFICO: preséntalas tal cual vienen (Norma y artículo / Infracción resumida / Calificación / Cuantía / Puntos / Responsable / Comentario resumido).
 6. Si hay varias alternativas porque falta un dato, preséntalas todas de forma breve y termina preguntando SOLO lo que indique "PREGUNTAS PENDIENTES".
 7. Si hay AVISOS que afecten a la decisión (porcentaje deducido, campos cortados, cercanía al umbral, criterio dudoso), inclúyelos al final en una línea.
+8. Si el bloque dice que no hay infracción o "No hay ficha aplicable", NO cites artículos, importes ni fichas que no estén en el propio bloque: da solo el resultado del cálculo.
+9. En "Responsable" copia exactamente lo que indique el bloque; no elijas tú entre varios responsables.
+10. Si el bloque contiene varias INFRACCIONES, preséntalas por separado, una lista por cada una.
 """
 CONFIG_MODOS["CALCULO"] = {
     "prompt": INSTRUCCION_CALCULO, "top_k": 0, "max_tokens": 1800,
@@ -752,7 +822,7 @@ with st.sidebar:
         st.rerun()
     st.caption(f"Filtros por metadatos: {'ON' if USAR_FILTROS_METADATOS else 'OFF'}")
     st.caption(f"Debug: {'ON' if MODO_DEBUG else 'OFF'}")
-    st.caption(f"Límite de peticiones a Gemini: {MAX_RPM}/min")
+    st.caption(f"Límite de peticiones a Gemini: {MAX_RPM}/min (embeddings: {MAX_RPM_EMBEDDING}/min)")
     if not CALCULOS_OK:
         st.caption("Calculadoras: OFF (falta calculos.py junto a app.py)")
     elif not DATOS_CALCULO:
@@ -795,18 +865,24 @@ if pregunta_usuario:
         texto_acumulado = ""
 
         try:
-            # 0. ¿Es un cálculo (tiempos, masas, dimensiones)? La IA extrae, Python calcula.
-            #    En "Consulta general" forzada no se usan las calculadoras.
-            resultado_calculo = {"estado": "sin_calculo", "texto": "", "etiqueta": ""}
-            extraccion = None
-            if (
-                DATOS_CALCULO
+            # 0. UN solo análisis por mensaje: modo + hechos infractores + datos para las calculadoras.
+            #    Se omite cuando no hace falta (modo forzado sin cálculo posible, o código de transporte).
+            codigo_transporte = detectar_codigo(pregunta_usuario)
+            posible_calculo = (
+                bool(DATOS_CALCULO)
                 and modo_forzado != "CONSULTA_GENERAL"
                 and parece_calculo(pregunta_usuario, st.session_state.get("calculo_reciente", False))
-            ):
-                extraccion = extraer_calculo(pregunta_usuario, historial_previo)
-                if extraccion:
-                    resultado_calculo = calcular(extraccion, DATOS_CALCULO)
+            )
+            necesita_analisis = posible_calculo or (not modo_forzado and not codigo_transporte)
+            modo_plan, hechos_plan, extraccion = "CONSULTA_GENERAL", [], None
+            if necesita_analisis:
+                modo_plan, hechos_plan, extraccion = analizar(pregunta_usuario, historial_previo, posible_calculo)
+
+            resultado_calculo = {"estado": "sin_calculo", "texto": "", "etiqueta": ""}
+            if posible_calculo and extraccion:
+                resultado_calculo = calcular(extraccion, DATOS_CALCULO)
+
+            respuesta_directa = None  # si no hace falta el modelo para responder, se rellena
 
             if resultado_calculo["estado"] != "sin_calculo":
                 modo = "CALCULO"
@@ -820,20 +896,25 @@ if pregunta_usuario:
                         st.json(extraccion)
                         st.markdown("**Resultado del cálculo (lo que recibe el modelo)**")
                         st.text(texto_calc)
-                prompt_actual = f"{texto_calc}\n\nPREGUNTA:\n{pregunta_usuario}"
+                if resultado_calculo["estado"] == "faltan":
+                    respuesta_directa = texto_faltan(texto_calc)  # pregunta directa: 0 llamadas al modelo
+                else:
+                    prompt_actual = f"{texto_calc}\n\nPREGUNTA:\n{pregunta_usuario}"
             else:
                 st.session_state.calculo_reciente = False
 
-                # 1. Modo: el elegido por el usuario o, en automático, el que decida el planificador
+                # 1. Modo: el elegido por el usuario, el de un código de transporte o el del análisis
                 hechos = []
                 if modo_forzado:
                     modo = modo_forzado
                     if modo == "MULTA_TRAFICO":
-                        hechos = descomponer_hechos(pregunta_usuario, historial_previo)
-                elif detectar_codigo(pregunta_usuario):
+                        hechos = hechos_plan or (
+                            descomponer_hechos(pregunta_usuario, historial_previo) if DESCOMPONER_EN_MODO_FORZADO else []
+                        )
+                elif codigo_transporte:
                     modo = "MULTA_TRANSPORTE"  # con un código de infracción de transporte es transporte seguro
                 else:
-                    modo, hechos = planificar(pregunta_usuario, historial_previo)
+                    modo, hechos = modo_plan, hechos_plan
                 cfg = CONFIG_MODOS[modo]
                 st.caption(cfg["etiqueta"] + (" · elegido por ti" if modo_forzado else ""))
 
@@ -851,6 +932,18 @@ if pregunta_usuario:
                     listas_lex = buscar_lexico(INDICES_LEXICOS, DATOS_CALCULO, modo, consultas, k=3)
                     fragmentos = fusionar(fragmentos, listas_lex, cfg["top_k"] * 2 + 2)
                     contexto = "\n\n---\n\n".join(fragmentos)
+                # Consecuencias (inmovilización, retirada, depósito): se añade la norma de referencia
+                texto_reciente = " ".join(
+                    [pregunta_usuario] + [m["content"] for m in historial_previo[-4:] if m["role"] == "user"]
+                )
+                if REFERENCIA_INMOVILIZACION and RE_CONSECUENCIA.search(texto_reciente):
+                    contexto += (
+                        "\n\n---\n\nNORMA DE REFERENCIA (arts. 104 y 105 LSV, instrucción y criterio de aplicación; "
+                        "úsala para responder sobre inmovilización, retirada y depósito):\n" + REFERENCIA_INMOVILIZACION
+                    )
+                # Velocidad, alcohol, drogas, temeridad, negativa: se añade siempre la norma de referencia penal
+                if REFERENCIA_PENAL and modo in ("MULTA_TRAFICO", "CONSULTA_GENERAL") and RE_PENAL.search(texto_reciente):
+                    contexto += "\n\n---\n\nNORMA DE REFERENCIA PENAL (úsala para decidir si es delito o infracción administrativa):\n" + REFERENCIA_PENAL
                 if MODO_DEBUG:
                     with st.expander(f"🔍 Debug · modo={modo} · filtro={filtro_usado} · {len(fragmentos)} fragmentos"):
                         if hechos:
@@ -860,36 +953,44 @@ if pregunta_usuario:
                             st.text(f[:700])
                 prompt_actual = f"CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta_usuario}"
 
-            # 1b. Historial conversacional
-            mensajes_previos = historial_previo[-VENTANA_HISTORIAL:]
-            contents_conversacion = [
-                {
-                    "role": "model" if m["role"] == "assistant" else "user",
-                    "parts": [{"text": m["content"]}],
-                }
-                for m in mensajes_previos
-            ]
-            contents_conversacion.append({"role": "user", "parts": [{"text": prompt_actual}]})
+            if respuesta_directa is not None:
+                texto_acumulado = respuesta_directa
+                response_placeholder.markdown(texto_acumulado)
+            else:
+                # 3. Historial conversacional
+                mensajes_previos = historial_previo[-VENTANA_HISTORIAL:]
+                contents_conversacion = [
+                    {
+                        "role": "model" if m["role"] == "assistant" else "user",
+                        "parts": [{"text": m["content"]}],
+                    }
+                    for m in mensajes_previos
+                ]
+                contents_conversacion.append({"role": "user", "parts": [{"text": prompt_actual}]})
 
-            # 2. Config según el modo
-            configuracion_ia = GenerateContentConfig(
-                system_instruction=cfg["prompt"],
-                max_output_tokens=cfg["max_tokens"],
-                temperature=cfg["temp"],
-            )
+                # 4. Config según el modo
+                configuracion_ia = GenerateContentConfig(
+                    system_instruction=cfg["prompt"],
+                    max_output_tokens=cfg["max_tokens"],
+                    temperature=cfg["temp"],
+                )
 
-            # 3. Streaming (pasa por el limitador de peticiones)
-            for chunk in generar_stream(
-                model=MODELO_GENERACION,
-                contents=contents_conversacion,
-                config=configuracion_ia,
-            ):
-                if chunk.text:
-                    texto_acumulado += chunk.text
-                    response_placeholder.markdown(texto_acumulado)
+                # 5. Streaming (pasa por el limitador de peticiones)
+                for chunk in generar_stream(
+                    model=MODELO_GENERACION,
+                    contents=contents_conversacion,
+                    config=configuracion_ia,
+                ):
+                    if chunk.text:
+                        texto_acumulado += chunk.text
+                        response_placeholder.markdown(texto_acumulado)
 
         except Exception as error:
             texto_acumulado = f"Consulta pausada por saturación en la red. Por favor, reintenta en un momento. ({error})"
             response_placeholder.markdown(texto_acumulado)
+
+        if MODO_DEBUG:
+            resumen = ", ".join(f"{n}× {m}" for m, n in Counter(LLAMADAS_CONSULTA).items()) or "ninguna"
+            st.caption(f"📡 Llamadas a Gemini en esta consulta: {len(LLAMADAS_CONSULTA)} ({resumen})")
 
     st.session_state.mensajes.append({"role": "assistant", "content": texto_acumulado})
