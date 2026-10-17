@@ -20,7 +20,11 @@ def cargar_datos(carpeta: str = "datos"):
     try:
         baremo = json.loads((base / "baremo_transporte.json").read_text(encoding="utf-8"))
         trafico = json.loads((base / "codificado_trafico.json").read_text(encoding="utf-8"))
-        return {"baremo": baremo, "trafico": trafico}
+        try:
+            velocidad = json.loads((base / "velocidad.json").read_text(encoding="utf-8"))
+        except Exception:
+            velocidad = None  # sin cuadro de velocidades, esa calculadora solo comprueba el umbral penal
+        return {"baremo": baremo, "trafico": trafico, "velocidad": velocidad}
     except Exception:
         return None
 
@@ -62,6 +66,14 @@ def lineas_ficha_transporte(f: dict, indent: str = "   ") -> str:
     return "\n".join(out)
 
 
+def _hecho_limpio(f: dict) -> str:
+    """La ficha 48/5A trae '(GRAVE)' en el texto aunque es muy grave: se quita para no contradecir la calificación."""
+    h = f["hecho"]
+    if re.search(r"\(GRAVE\)\s*$", h) and f["calificacion"].lower() != "grave":
+        h = re.sub(r"\s*\(GRAVE\)\s*$", "", h)
+    return h
+
+
 def lineas_ficha_trafico(f: dict, indent: str = "   ") -> str:
     reg = REGLAMENTO.get(f["norma"].split()[0], f["norma"].split()[0])
     art = f"Art. {_num(f['art_reg'])}.{f['apartado_reg']} {reg}" if f["apartado_reg"] else f"Art. {_num(f['art_reg'])} {reg}"
@@ -73,7 +85,7 @@ def lineas_ficha_trafico(f: dict, indent: str = "   ") -> str:
     red = f" (cuantía reducida: {fmt_eur(f['multa_reducida'])})" if f["multa_reducida"] is not None else ""
     out = [
         f"{indent}- Norma y artículo / Precepto: {art} · opción {f['opcion']}",
-        f"{indent}- Infracción: {f['hecho'][:400]}",
+        f"{indent}- Infracción: {_hecho_limpio(f)[:400]}",
         f"{indent}- Calificación: {cal}",
         f"{indent}- Cuantía: {fmt_eur(f['multa'])}{red}",
         f"{indent}- Puntos: {f['puntos'] or '0'}",
@@ -393,6 +405,10 @@ def resolver_dimensiones(p: dict, datos: dict) -> dict:
         return _faltan("dimensiones", etiqueta, faltan)
 
     limite, desc = LIMITES[mag][tipo]
+    if mag == "longitud" and limite >= 10 and medida < 0.4 * limite:
+        return _faltan("dimensiones", etiqueta, [
+            f"confirmar que {medida:.2f} m es la longitud TOTAL del vehículo y no lo que sobresale la carga "
+            f"(si es lo que sobresale, es otro cálculo: art. 15 RGC)"])
     mods = [m for m in (p.get("modificadores") or []) if m in MODIFICADORES] if mag == "longitud" else []
     extra = sum(MODIFICADORES[m][0] for m in mods)
     limite_total = limite + extra
@@ -445,14 +461,319 @@ def resolver_dimensiones(p: dict, datos: dict) -> dict:
 
 
 # ==================================================================
+# 4. CARGA QUE SOBRESALE (art. 15 RGC)
+# ==================================================================
+def limite_carga(excl, direccion, L, W, indiv, tipo_carga, ancho_total):
+    """Devuelve (límite_m, explicación). Límite 0 = no puede sobresalir nada."""
+    if W is not None and W < 1:  # ap. 4: vehículos de anchura inferior a 1 m
+        if direccion == "lateral":
+            return 0.50, "ap. 4: vehículo de anchura inferior a 1 m: hasta 0,50 m a cada lado de su eje longitudinal"
+        if direccion == "delante":
+            return 0.0, "ap. 4: no puede sobresalir por la extremidad anterior"
+        return 0.25, "ap. 4: por detrás hasta 0,25 m"
+    if excl is False:  # ap. 3: resto de vehículos
+        if direccion == "detras":
+            pct = 15 if indiv else 10
+            return L * pct / 100, f"ap. 3: por detrás hasta el {pct} % de la longitud del vehículo ({L:.2f} m)" \
+                                  f"{' (carga indivisible)' if indiv else ' (carga divisible)'}"
+        return 0.0, "ap. 1 y 3: en vehículos no destinados exclusivamente a mercancías la carga solo puede sobresalir por detrás"
+    # ap. 2: vehículos destinados exclusivamente al transporte de mercancías
+    if not indiv:
+        return 0.0, "ap. 1 y 2: solo la carga indivisible puede sobresalir en estos vehículos"
+    if direccion in ("delante", "detras") and tipo_carga == "longitud_indivisible":
+        if L > 5:
+            lim = 2.0 if direccion == "delante" else 3.0
+            return lim, f"ap. 2.a.1.º: vehículo de más de 5 m: {lim:g} m por la parte {'anterior' if direccion == 'delante' else 'posterior'}"
+        return L / 3, f"ap. 2.a.2.º: vehículo de 5 m o menos: un tercio de su longitud ({L:.2f} m) por cada extremo"
+    if direccion == "lateral":
+        if ancho_total is not None and ancho_total > 2.55:
+            return 0.0, "ap. 2.b: el ancho total supera 2,55 m, por lo que no se permite sobresalir lateralmente"
+        return 0.40, ("ap. 2.b: hasta 0,40 m por cada lateral, solo si la dimensión menor de la carga indivisible supera "
+                      "el ancho del vehículo y el ancho total no pasa de 2,55 m")
+    return 0.0, "ap. 1 y 2: la carga indivisible no longitudinal solo puede sobresalir lateralmente (ap. 2.b)"
+
+
+def resolver_cargas(p: dict, datos: dict) -> dict:
+    etiqueta = "🧮 Cálculo: carga que sobresale (art. 15 RGC)"
+    if p.get("transporte_especial"):
+        return _resultado("completo", "cargas", etiqueta,
+                          "RESULTADO DEL CÁLCULO (verificado por código)\nTransporte especial: según el art. 15.8 RGC se estará "
+                          "a lo dispuesto en su autorización. No se calcula el límite; pregunta por las condiciones de la autorización.")
+    excl, direccion, sobresale = p.get("vehiculo_exclusivo_mercancias"), p.get("direccion"), p.get("sobresale_m")
+    indiv, tipo, L, W = p.get("indivisible"), p.get("tipo_carga"), p.get("longitud_vehiculo_m"), p.get("ancho_vehiculo_m")
+    faltan = []
+    if excl not in (True, False):
+        faltan.append("si el vehículo está destinado EXCLUSIVAMENTE al transporte de mercancías (decide qué apartado del art. 15 se aplica)")
+    if direccion not in ("detras", "delante", "lateral"):
+        faltan.append("por dónde sobresale la carga (detrás, delante o lateral)")
+    if not sobresale:
+        faltan.append("cuánto sobresale la carga (metros)")
+    if indiv not in (True, False):
+        faltan.append("si la carga es indivisible")
+    if indiv is True and excl is True and tipo not in ("longitud_indivisible", "otra") and direccion in ("delante", "detras"):
+        faltan.append("si es carga de longitud indivisible (vigas, postes, tubos) u otra carga indivisible")
+    necesita_L = (excl is False and direccion == "detras" and not (W is not None and W < 1)) or \
+                 (excl is True and indiv is True and tipo == "longitud_indivisible" and direccion in ("delante", "detras"))
+    if necesita_L and not L:
+        faltan.append("la longitud del vehículo (m)")
+    if L and (L < 1 or L > 25):
+        faltan.append(f"confirmar la longitud del vehículo ({L:g} m): no parece plausible")
+    if sobresale and sobresale > 15:
+        faltan.append(f"confirmar cuánto sobresale la carga ({sobresale:g} m): no parece plausible")
+    if faltan:
+        return _faltan("cargas", etiqueta, faltan)
+
+    lim, expl = limite_carga(excl, direccion, L, W, indiv, tipo, p.get("ancho_total_m"))
+    exceso = sobresale - lim
+    nombre = {"detras": "por detrás", "delante": "por delante", "lateral": "por un lateral"}[direccion]
+    lineas = ["RESULTADO DEL CÁLCULO (verificado por código; no recalcules ni cambies estas cifras)",
+              "Tipo de cálculo: carga que sobresale (art. 15 RGC)",
+              f"Vehículo: {'destinado exclusivamente a mercancías' if excl else 'NO destinado exclusivamente a mercancías'}"
+              + (f" · longitud {L:.2f} m" if L else "") + f" · carga {'indivisible' if indiv else 'divisible'}",
+              f"Sobresale {nombre}: {sobresale:.2f} m · límite permitido: {lim:.2f} m ({expl})"]
+    fichas, preguntas, avisos = [], [], []
+    f_exceso = _trafico(datos, "CIR LSV", "015", "5A", "1")
+    f_senal = _trafico(datos, "CIR LSV", "015", "5A", "6")
+    f_noct = _trafico(datos, "CIR LSV", "015", "5B", "6")
+    f_later = _trafico(datos, "CIR LSV", "015", "5A", "7")
+
+    if exceso > 1e-9:
+        lineas.append(f"RESULTADO: supera el límite en {round(exceso * 100)} cm"
+                      + (f" ({exceso / lim * 100:.0f} % por encima del límite)" if lim > 0 else "") + ".")
+        if f_exceso:
+            fichas.append(("INFRACCIÓN 1: la carga sobresale más de lo permitido (art. 15.1)", f_exceso, None))
+    else:
+        lineas.append(f"RESULTADO: no supera el límite ({sobresale:.2f} m ≤ {lim:.2f} m): sin infracción por el tamaño del sobresalimiento.")
+
+    luz, visib, v20 = p.get("luz"), p.get("visibilidad_reducida"), p.get("senal_v20")
+    if sobresale > 0 and direccion == "detras" and not (W is not None and W < 1):
+        if v20 is False:
+            resp = "titular (no hay señal V-20 en el vehículo; la ficha dice que si la señal está en el vehículo es el conductor y en otro caso el titular)"
+            if f_senal:
+                fichas.append(("INFRACCIÓN 2: no señalizar con la señal V-20 la carga que sobresale por detrás (art. 15.6)", f_senal, resp))
+            avisos.append("Un pañuelo, trapo o cinta no es la señal V-20 (Anexo XI RGVeh): panel en el extremo posterior, "
+                          "perpendicular al eje; dos paneles en V invertida si la carga ocupa toda la anchura.")
+        elif v20 is True:
+            lineas.append("Señalización: lleva la señal V-20 (comprueba que es el panel reglamentario y, si la carga ocupa toda la anchura, que lleva dos paneles).")
+        else:
+            preguntas.append("¿Lleva la carga la señal V-20 (panel reglamentario)?")
+    if sobresale > 0 and direccion in ("detras", "delante"):
+        if visib is True and luz is False and f_noct:
+            fichas.append((f"INFRACCIÓN: circular de noche o con poca visibilidad sin la luz {'roja' if direccion == 'detras' else 'blanca'} (art. 15.6, 2.º párrafo)", f_noct, None))
+        elif visib is None:
+            preguntas.append("¿Circulaba entre la puesta y la salida del sol o con visibilidad reducida (exige luz roja detrás / blanca delante)?")
+    if sobresale > 0 and direccion == "lateral" and visib is True and luz is False and f_later:
+        fichas.append(("INFRACCIÓN: carga lateral sin señalizar (art. 15.7)", f_later, None))
+    if sobresale > 0 and direccion == "lateral" and visib is None:
+        preguntas.append("¿Circulaba de noche o con visibilidad reducida? (la señalización lateral del art. 15.7 se exige entonces si la carga queda a más de 0,40 m de la luz de posición)")
+
+    for titulo, f, resp in fichas:
+        lineas.append("\n" + titulo + ":")
+        txt = lineas_ficha_trafico(f)
+        if resp:  # la ficha trae una regla ("si la señal está en el vehículo..."): se sustituye por el resultado aplicado
+            txt = re.sub(r"(?m)^(\s+)- Responsable: .*$", lambda m: f"{m.group(1)}- Responsable (aplicando la regla de la propia ficha): {resp}", txt)
+        lineas.append(txt)
+    if not fichas:
+        lineas.append("No hay ficha aplicable con estos datos: no cites artículos ni importes.")
+    if avisos:
+        lineas.append("\nAVISOS: " + " ".join(avisos))
+    if preguntas:
+        lineas.append("\nPREGUNTAS PENDIENTES (hazlas al final, en una o dos frases cortas):")
+        lineas += [f"  - {q}" for q in preguntas]
+    return _resultado("completo", "cargas", etiqueta, "\n".join(lineas))
+
+
+# ==================================================================
+# 5. VELOCIDAD: umbral penal (art. 379.1 CP) + graduación administrativa (cuadro DGT)
+# ==================================================================
+UMBRAL_PENAL = {"urbana": 60, "interurbana": 80, "travesia": 80}   # km/h sobre el límite (travesías: criterio de vía interurbana)
+HOLGURA_EMP = 0.15   # si para evitar el delito habría que restar más del 15 % de la velocidad leída, se considera
+                     # evidente (ningún cinemómetro tiene un error máximo permitido tan alto). Ajústalo a tus tablas.
+OPCION_PUNTUAL = {100: "5M", 300: "5I", 400: "5G", 500: "5E", 600: "5A"}
+OPCION_TRAMO = {100: "5N", 300: "5J", 400: "5H", 500: "5F", 600: "5B"}
+OPCION_ACCESO_PUNTUAL = {600: "5C"}   # el resto (100-500 €) es la 5K, de importe variable
+OPCION_ACCESO_TRAMO = {600: "5D"}     # el resto (100-500 €) es la 5L, de importe variable
+
+
+def corregir_velocidad(datos, v, cinemometro, nuevo=False):
+    """Resta el margen del cinemómetro si está en la tabla Y confirmado.
+    Devuelve (velocidad_corregida, texto) o (None, None) si no se puede aplicar."""
+    vel = (datos or {}).get("velocidad") or {}
+    m = vel.get("margenes") or {}
+    cfg = ((m.get("tipos") or {}).get(cinemometro) or {}).get("nuevo" if nuevo else "en_servicio")
+    if not m.get("activo") or not cfg or not cfg.get("confirmado"):
+        return None, None
+    etapa = "nuevo (fase de conformidad)" if nuevo else "en servicio"
+    if v <= cfg["hasta_kmh"]:
+        return v - cfg["fijo_kmh"], f"margen de cinemómetro {cinemometro} {etapa}: {cfg['fijo_kmh']} km/h (hasta {cfg['hasta_kmh']} km/h)"
+    return int(v * (1 - cfg["porcentaje"] / 100)), f"margen de cinemómetro {cinemometro} {etapa}: {cfg['porcentaje']} % (por encima de {cfg['hasta_kmh']} km/h), redondeado hacia abajo"
+
+
+def tramo_velocidad(datos, limite, v_corr):
+    tabla = ((datos.get("velocidad") or {}).get("graduacion") or {}).get(str(int(limite)))
+    if not tabla:
+        return "sin_tabla"
+    for desde, hasta, multa, pts, cal in tabla:
+        if v_corr >= desde and (hasta is None or v_corr <= hasta):
+            return {"desde": desde, "hasta": hasta, "multa": multa, "puntos": pts, "calificacion": cal}
+    return None  # por debajo del primer tramo: sin infracción
+
+
+def _ficha_velocidad(datos, opcion, art="052"):
+    for f in datos["trafico"]:
+        if f["art_reg"] == art and f["opcion"] == opcion and f["apartado_reg"] == "1" \
+                and f["norma"].startswith("CIR") and "KM/H" in f["hecho"]:
+            return f
+    return None
+
+
+ARTICULO_GENERICO = {"urbana": "050", "travesia": "050", "interurbana": "048"}
+CRITERIO_ARTICULO = {
+    "048": "límite genérico de vías interurbanas (fuera de poblado)",
+    "050": "límite genérico en poblado: calles urbanas y travesías",
+    "052": "límite fijado por señal (vertical, marcas viales o panel) o limitación específica de un vehículo o de un conductor",
+}
+
+
+def articulos_velocidad(via, origen):
+    """Qué artículo del RGC se cita: 48 (genérico interurbano), 50 (genérico urbano o travesía) o 52 (señalizado o específico)."""
+    gen = ARTICULO_GENERICO.get(via)
+    if origen == "senalizado":
+        return ["052"]
+    if origen == "generico":
+        return [gen] if gen else ["048", "050"]
+    return ([gen] if gen else ["048", "050"]) + ["052"]  # origen desconocido: se ofrecen las alternativas
+
+
+def _rellenar_hecho(h: str, vel, lim) -> str:
+    """'CIRCULAR A ... KM/H, ESTANDO LIMITADA LA VELOCIDAD A ... KM/H' -> con la velocidad corregida y el límite del caso."""
+    partes = h.split("...")
+    if len(partes) == 3:
+        return f"{partes[0]}{vel:g}{partes[1]}{lim:g}{partes[2]}"
+    return h
+
+
+def _precepto(f):
+    ap = f["apartado_reg"]
+    return f"Art. {_num(f['art_reg'])}.{ap} RGC · Art. {_num(f['art_lsv'])}.{f['apartado_lsv']} LSV"
+
+
+def resolver_velocidad(p: dict, datos: dict) -> dict:
+    etiqueta = "🧮 Cálculo: velocidad"
+    v, lim, via, vc = p.get("velocidad_medida_kmh"), p.get("limite_kmh"), p.get("via"), p.get("velocidad_corregida_kmh")
+    cin, nuevo = p.get("cinemometro"), bool(p.get("radar_nuevo"))
+    if not v or not lim or v <= lim:
+        return _resultado("sin_calculo", None, "", "")
+    exceso = v - lim
+    conocidos = f"velocidad medida {v:g} km/h, límite {lim:g} km/h (exceso medido {exceso:g} km/h)"
+
+    # ¿Hay margen que restar automáticamente?
+    txt_margen = None
+    if not vc and cin in ("fijo", "movil", "tramo"):
+        vc, txt_margen = corregir_velocidad(datos, v, cin, nuevo)
+
+    # --- 1. umbral penal ---
+    if exceso > min(UMBRAL_PENAL.values()):
+        if via not in UMBRAL_PENAL:
+            return _faltan("velocidad", etiqueta, ["si es vía urbana, interurbana o travesía (el umbral penal es +60 km/h en urbana y +80 km/h en interurbana)"], conocidos)
+        umbral = UMBRAL_PENAL[via]
+        if exceso > umbral:
+            nombre_via = {"urbana": "urbana", "interurbana": "interurbana", "travesia": "travesía (se aplica el umbral de vía interurbana)"}[via]
+            cab = ["RESULTADO DEL CÁLCULO (verificado por código; no recalcules ni cambies estas cifras)",
+                   "Tipo de cálculo: velocidad, umbral penal del art. 379.1 CP",
+                   f"Velocidad medida: {v:g} km/h · límite: {lim:g} km/h · vía {nombre_via} · umbral penal: más de {umbral} km/h sobre el límite"]
+            delito = None
+            if vc:
+                exceso_c = vc - lim
+                cab.append(f"Velocidad corregida: {vc:g} km/h" + (f" ({txt_margen})" if txt_margen else " (aportada)") + f" → exceso corregido {exceso_c:g} km/h")
+                if exceso_c > umbral:
+                    cab.append(f"RESULTADO: el exceso corregido ({exceso_c:g} km/h) supera el umbral de {umbral} km/h: PRESUNTO DELITO del art. 379.1 CP.")
+                    delito = True
+                else:
+                    delito = False  # tras el margen no llega: vía administrativa
+            else:
+                margen_necesario = exceso - umbral
+                cab.append(f"Exceso medido (sin corregir): {exceso:g} km/h. Para que NO fuese delito habría que restar un margen de más de "
+                           f"{margen_necesario:g} km/h ({margen_necesario / v * 100:.0f} % de la velocidad leída).")
+                if margen_necesario > HOLGURA_EMP * v:
+                    cab.append("RESULTADO: ese margen es muy superior al error máximo permitido de cualquier cinemómetro: PRESUNTO DELITO del art. 379.1 CP "
+                               "(el EMP exacto del equipo se aplicará en el atestado, pero no puede cambiar el resultado).")
+                    delito = True
+                else:
+                    return _faltan("velocidad", etiqueta, [
+                        "la velocidad corregida, es decir, la leída menos el margen (EMP) del cinemómetro según su certificado: "
+                        "el exceso está cerca del umbral penal y el margen decide si es delito"], conocidos)
+            if delito:
+                cab += [
+                    "Consecuencia: no se formula multa administrativa por este hecho; procede el atestado y el traslado por presunto delito contra la seguridad vial.",
+                    "Criterio del RAG: el delito solo existe si la velocidad neta, tras restar el EMP, supera el umbral (+61 km/h en urbana, +81 km/h en interurbana).",
+                    "AVISOS: no cites la ficha del art. 52 como sanción de este hecho.",
+                ]
+                return _resultado("completo", "velocidad", etiqueta, "\n".join(cab))
+            # delito descartado tras el margen: se sigue con la graduación administrativa
+
+    # --- 2. graduación administrativa (cuadro DGT) ---
+    if not (datos.get("velocidad") or {}).get("graduacion"):
+        return _resultado("sin_calculo", None, "", "")
+    if not vc:
+        if cin in ("fijo", "movil", "tramo"):
+            return _faltan("velocidad", etiqueta, [
+                f"la velocidad corregida, es decir, la leída menos el margen del cinemómetro {cin} según su certificado "
+                "(la app no tiene confirmado el margen de ese tipo de radar)"], conocidos)
+        return _faltan("velocidad", etiqueta, [
+            "el tipo de cinemómetro (fijo, móvil o de tramo) o directamente la velocidad corregida tras restar su margen"], conocidos)
+    tramo = tramo_velocidad(datos, lim, vc)
+    if tramo == "sin_tabla":
+        return _resultado("sin_calculo", None, "", "")  # límite que no figura en el cuadro: flujo normal
+    lineas = ["RESULTADO DEL CÁLCULO (verificado por código; no recalcules ni cambies estas cifras)",
+              "Tipo de cálculo: velocidad, graduación de la sanción (cuadro de velocidades de la DGT)",
+              f"Velocidad medida: {v:g} km/h · velocidad corregida: {vc:g} km/h" + (f" ({txt_margen})" if txt_margen else " (aportada)") + f" · límite: {lim:g} km/h"]
+    if tramo is None:
+        lineas.append("RESULTADO: tras restar el margen la velocidad no supera el primer tramo del cuadro para ese límite: sin infracción por velocidad.")
+        lineas.append("No hay ficha aplicable: no cites artículos ni importes.")
+        return _resultado("completo", "velocidad", etiqueta, "\n".join(lineas))
+    multa, pts = tramo["multa"], tramo["puntos"]
+    rango = f"{tramo['desde']} a {tramo['hasta']} km/h" if tramo["hasta"] else f"{tramo['desde']} km/h en adelante"
+    lineas.append(f"Tramo del cuadro para límite {lim:g}: {rango} → {multa} € · {pts} puntos · {tramo['calificacion']}")
+    de_tramo = cin == "tramo"
+    opcion = (OPCION_TRAMO if de_tramo else OPCION_PUNTUAL)[multa]
+    arts = articulos_velocidad(via, p.get("limite_origen"))
+    fichas_art = [(art, _ficha_velocidad(datos, opcion, art)) for art in arts]
+    fichas_art = [(art, f) for art, f in fichas_art if f]
+    lineas.append(f"\nFICHA APLICABLE (opción {opcion}, {'velocidad media en tramo' if de_tramo else 'medición puntual'}):")
+    if fichas_art:
+        txt = lineas_ficha_trafico(fichas_art[0][1])
+        txt = re.sub(r"(?m)^(\s+)- Puntos: .*$", lambda m: f"{m.group(1)}- Puntos: {pts} (según el cuadro de velocidades; la ficha puede traer «0, 2, 4, 6»)", txt)
+        txt = re.sub(r"(?m)^(\s+- Infracción: )(.*)$", lambda m: m.group(1) + _rellenar_hecho(m.group(2), vc, lim), txt)
+        if len(fichas_art) > 1:  # origen del límite desconocido: la multa y los puntos son los mismos, cambia el artículo
+            opciones = " ó ".join(f"{_precepto(f)} ({CRITERIO_ARTICULO[art]})" for art, f in fichas_art)
+            txt = re.sub(r"(?m)^(\s+)- Norma y artículo / Precepto: .*$",
+                         lambda m: f"{m.group(1)}- Norma y artículo / Precepto: {opciones}. Elige según el origen del límite (la multa y los puntos son iguales)", txt)
+        else:
+            txt = re.sub(r"(?m)^(\s+)- Norma y artículo / Precepto: .*$",
+                         lambda m: f"{m.group(1)}- Norma y artículo / Precepto: {_precepto(fichas_art[0][1])} · opción {opcion} ({CRITERIO_ARTICULO[fichas_art[0][0]]})", txt)
+        lineas.append(txt)
+    avisos = []
+    acc = (OPCION_ACCESO_TRAMO if de_tramo else OPCION_ACCESO_PUNTUAL).get(multa, "5L" if de_tramo else "5K")
+    avisos.append(f"Si se detectó en un tramo de autopista o autovía de acceso a una ciudad, las opciones son otras: "
+                  f"{acc} ({'600 €, muy grave' if multa == 600 else 'importe variable entre 100 y 500 €, puntos 0/2/4/6'}).")
+    lineas.append("\nAVISOS: " + " ".join(avisos))
+    return _resultado("completo", "velocidad", etiqueta, "\n".join(lineas))
+
+
+# ==================================================================
 # Entrada única
 # ==================================================================
 def calcular(extraccion: dict, datos: dict) -> dict:
     tipo = (extraccion or {}).get("calculo")
-    if datos is None or tipo not in ("tiempos", "masas", "dimensiones"):
+    if datos is None or tipo not in ("tiempos", "masas", "dimensiones", "cargas", "velocidad"):
         return _resultado("sin_calculo", None, "", "")
     if tipo == "tiempos":
         return resolver_tiempos(extraccion.get("tiempos") or {}, datos)
     if tipo == "masas":
         return resolver_masas(extraccion.get("masas") or {}, datos)
+    if tipo == "cargas":
+        return resolver_cargas(extraccion.get("cargas") or {}, datos)
+    if tipo == "velocidad":
+        return resolver_velocidad(extraccion.get("velocidad") or {}, datos)
     return resolver_dimensiones(extraccion.get("dimensiones") or {}, datos)
