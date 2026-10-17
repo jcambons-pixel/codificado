@@ -1,0 +1,27 @@
+NORMA DE REFERENCIA PENAL (extracto de tu RAG: velocidad, alcohol, drogas, temeridad y negativa a las pruebas)
+
+1. EXCESO DE VELOCIDAD (art. 379.1 CP)
+- Vía penal (delito): conducir un vehículo a motor o ciclomotor a una velocidad superior a la permitida en más de 60 km/h en vía urbana o en más de 80 km/h en vía interurbana.
+  · Criterio técnico de prueba: se exige aplicar el Error Máximo Permitido (EMP) del cinemómetro (in dubio pro reo) sobre la velocidad leída. El delito solo existe si la velocidad neta resultante tras restar el margen supera el umbral (+61 km/h o +81 km/h).
+  · Travesías: por regla general jurisprudencial se aplican los límites de las vías interurbanas (+80 km/h).
+- Vía administrativa: si tras descontar el margen de error el exceso no alcanza el umbral de +61/+80 km/h, o si se trata de un simple incumplimiento del deber de moderar la velocidad (art. 46 RGC), la conducta se sanciona administrativamente con multa de 100 € a 600 € y pérdida de hasta 6 puntos conforme al Anexo IV de la LSV.
+
+2. CONDUCCIÓN BAJO LA INFLUENCIA DE ALCOHOL (art. 379.2 CP)
+- Vía penal (delito), dos modalidades:
+  1) Tasa objetiva: conducir con una tasa de alcohol en aire espirado superior a 0,60 mg/l (o 1,2 g/l en sangre). Para imputar el delito atendiendo únicamente a la cifra, la jurisprudencia del Tribunal Supremo (SSTS 788/2023 y 789/2023) exige que la menor de las mediciones en etilómetro evidencial sea de al menos 0,66 mg/l (para garantizar los >0,60 mg/l tras descontar el 7,5 % del error metrológico).
+  2) Tasa genérica / sintomatología: conducir "bajo la influencia" con tasas comprendidas entre 0,40 mg/l y 0,65 mg/l. Requiere probar la afección real en la conducción (maniobras anómalas, accidente) acompañada del acta de signos externos de embriaguez.
+- Vía administrativa: tasas de 0,25 a 0,60 mg/l en conductores generales (o de 0,15 a 0,30 mg/l en noveles y profesionales) sin síntomas mermantes se sancionan con 500 € a 1.000 € y detracción de 4 a 6 puntos.
+
+3. CONDUCCIÓN BAJO LA INFLUENCIA DE DROGAS (art. 379.2 CP)
+- Vía penal: exige demostrar la influencia efectiva de la sustancia en las facultades psico-físicas de la conducción mediante la sintomatología externa y/o la conducción anómala. Según la STS 610/2023, la simple presencia en el organismo acreditada por el laboratorio no constituye delito si no consta probada la alteración en la conducción.
+- Vía administrativa: la mera presencia de drogas en el organismo (test salival indiciario + confirmatorio de laboratorio) es infracción administrativa muy grave sancionada con 1.000 € y 6 puntos (art. 14.1 LSV), salvo fármacos bajo prescripción facultativa y fin terapéutico que no afecten a la conducción.
+
+4. CONDUCCIÓN TEMERARIA Y CON MANIFIESTO DESPRECIO (arts. 380 y 381 CP)
+- Temeraria genérica (art. 380.1 CP): exige dos requisitos acumulativos: temeridad manifiesta (infracción notoria de las reglas elementales de tráfico) Y la creación de un concreto peligro para la vida o integridad de personas determinadas.
+- Presunción de temeridad (art. 380.2 CP): se reputa temeraria la conducción en la que concurran simultáneamente el exceso de velocidad penal (+60/+80 km/h) Y la tasa de alcohol penal (>0,60 mg/l), exigiendo asimismo el peligro concreto.
+- Conducción "suicida" (art. 381 CP): modalidad agravada con manifiesto desprecio por la vida de los demás (circulación dolosa en sentido contrario por autovía, carreras ilegales en zonas peatonales). Punible con peligro concreto (381.1) y en situación de peligro abstracto (381.2).
+- Vía administrativa: la conducción temeraria sin concreción de un peligro real sobre la vida o integridad de personas identificables es infracción muy grave (500 € y 6 puntos, art. 3.1 RGC / art. 77.e LSV).
+
+5. NEGATIVA A SOMETERSE A LAS PRUEBAS (art. 383 CP)
+- Vía penal: delito de desobediencia especial que castiga al conductor de un vehículo de motor o ciclomotor que, tras requerimiento formal de los agentes, se niega a someterse a las pruebas de alcoholemia o drogas. Abarca la negativa inicial y la negativa a la segunda prueba de contraste obligatoria o a facilitar la muestra salival de confirmación (STS 210/2017).
+- Vía administrativa: la negativa solo es infracción administrativa (1.000 €, art. 77.d LSV) cuando el obligado es un usuario que no conduce un vehículo de motor o ciclomotor (ciclistas, conductores de VMP, o peatones implicados en un siniestro o infracción).
