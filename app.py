@@ -16,7 +16,7 @@ try:
 except ImportError:  # sin buscador.py la app sigue con la búsqueda semántica sola
     BUSCADOR_OK = False
 try:
-    from calculos import cargar_datos, calcular, opciones_dimension_para_prompt
+    from calculos import cargar_datos, calcular, opciones_dimension_para_prompt, extraer_velocidad_conversacion
     CALCULOS_OK = True
 except ImportError:  # falta calculos.py junto a app.py: la app sigue funcionando sin calculadoras
     CALCULOS_OK = False
@@ -29,6 +29,9 @@ except ImportError:  # falta calculos.py junto a app.py: la app sigue funcionand
 
     def opciones_dimension_para_prompt():
         return ""
+
+    def extraer_velocidad_conversacion(*args, **kwargs):
+        return None
 
 # ------------------------------------------------------------------
 # Logo del proyecto
@@ -832,6 +835,7 @@ with st.sidebar:
         st.caption("Calculadoras: OFF (falta la carpeta datos/ con los 2 JSON)")
     else:
         st.caption("Calculadoras: ON")
+        st.caption("Cuadro de velocidad: ON" if DATOS_CALCULO.get("velocidad") else "Cuadro de velocidad: OFF (falta datos/velocidad.json)")
     if MODO_DEBUG:
         st.caption(f"Códigos de transporte cargados: {len(CODIGOS_TRANSPORTE)}")
 
@@ -871,19 +875,37 @@ if pregunta_usuario:
             # 0. UN solo análisis por mensaje: modo + hechos infractores + datos para las calculadoras.
             #    Se omite cuando no hace falta (modo forzado sin cálculo posible, o código de transporte).
             codigo_transporte = detectar_codigo(pregunta_usuario)
+            resultado_calculo = {"estado": "sin_calculo", "texto": "", "etiqueta": "", "respuesta": None}
+            extraccion, origen_calculo = None, ""
+
+            # 0a. VELOCIDAD: se lee directamente del texto (sin IA). Es el caso más frecuente y no debe depender de
+            #     que el modelo extraiga bien la frase; además no gasta ninguna llamada a Gemini.
+            if DATOS_CALCULO and modo_forzado != "CONSULTA_GENERAL":
+                vel_local = extraer_velocidad_conversacion(
+                    pregunta_usuario,
+                    [m["content"] for m in historial_previo if m["role"] == "user"],
+                    st.session_state.get("calculo_reciente", False),
+                )
+                if vel_local:
+                    extraccion = {"calculo": "velocidad", "velocidad": vel_local}
+                    resultado_calculo = calcular(extraccion, DATOS_CALCULO)
+                    origen_calculo = "leída del texto, sin IA"
+
+            # 0b. Si no era velocidad: UN solo análisis por mensaje (modo + hechos infractores + datos de las calculadoras).
+            #     Se omite cuando no hace falta (modo forzado sin cálculo posible, código de transporte, o cálculo ya resuelto).
             posible_calculo = (
                 bool(DATOS_CALCULO)
                 and modo_forzado != "CONSULTA_GENERAL"
                 and parece_calculo(pregunta_usuario, st.session_state.get("calculo_reciente", False))
             )
-            necesita_analisis = posible_calculo or (not modo_forzado and not codigo_transporte)
-            modo_plan, hechos_plan, extraccion = "CONSULTA_GENERAL", [], None
+            ya_resuelto = resultado_calculo["estado"] != "sin_calculo"
+            necesita_analisis = (posible_calculo or (not modo_forzado and not codigo_transporte)) and not ya_resuelto
+            modo_plan, hechos_plan = "CONSULTA_GENERAL", []
             if necesita_analisis:
-                modo_plan, hechos_plan, extraccion = analizar(pregunta_usuario, historial_previo, posible_calculo)
-
-            resultado_calculo = {"estado": "sin_calculo", "texto": "", "etiqueta": ""}
-            if posible_calculo and extraccion:
-                resultado_calculo = calcular(extraccion, DATOS_CALCULO)
+                modo_plan, hechos_plan, extraccion_ia = analizar(pregunta_usuario, historial_previo, posible_calculo)
+                if posible_calculo and extraccion_ia:
+                    extraccion, origen_calculo = extraccion_ia, "extraída por la IA"
+                    resultado_calculo = calcular(extraccion_ia, DATOS_CALCULO)
 
             respuesta_directa = None  # si no hace falta el modelo para responder, se rellena
 
@@ -895,7 +917,7 @@ if pregunta_usuario:
                 st.caption(resultado_calculo["etiqueta"])
                 if MODO_DEBUG:
                     with st.expander("🔍 Debug · cálculo"):
-                        st.markdown("**Datos extraídos por la IA**")
+                        st.markdown(f"**Datos del cálculo ({origen_calculo})**")
                         st.json(extraccion)
                         st.markdown("**Resultado del cálculo (lo que recibe el modelo)**")
                         st.text(texto_calc)
@@ -953,6 +975,11 @@ if pregunta_usuario:
                     with st.expander(f"🔍 Debug · modo={modo} · filtro={filtro_usado} · {len(fragmentos)} fragmentos"):
                         if hechos:
                             st.markdown("**Hechos infractores detectados:** " + " | ".join(hechos))
+                        if posible_calculo or extraccion:
+                            st.markdown("**Calculadora no usada:** " + (
+                                resultado_calculo.get("motivo") or "la extracción no identificó ningún cálculo (calculo = null)"))
+                            if extraccion:
+                                st.json(extraccion)
                         for i, f in enumerate(fragmentos, 1):
                             st.markdown(f"**Fragmento {i}**")
                             st.text(f[:700])
