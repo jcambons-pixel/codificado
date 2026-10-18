@@ -316,7 +316,7 @@ combinando los datos de TODA la conversación. Estructura:
  "tiempos": {"eventos": [{"tipo": "conduccion|pausa|descanso", "minutos": entero}], "transporte": "mercancias|viajeros|null", "ampliacion_10h": true|false|null},
  "masas": {"peso_medido_kg": número|null, "mma_kg": número|null, "margen_bascula": {"valor": número, "unidad": "kg|%"}|null, "peso_ya_neto": true|null, "categoria": "N1|N2|N3|null", "mma_vehiculo_kg": número|null, "regimen": "publico|privado|null", "base": "mma|eje|null"},
  "dimensiones": {"magnitud": "longitud|anchura|altura|null", "medida_m": número|null, "tipo_vehiculo": clave|null, "modificadores": [claves], "causa_exceso": "carga_indivisible|caracteristica_tecnica|otra|null", "autorizacion": "sin_autorizacion|incumple_condiciones|con_autorizacion_cumple|null"},
- "velocidad": {"velocidad_medida_kmh": número|null, "limite_kmh": número|null, "via": "urbana|interurbana|travesia|null", "velocidad_corregida_kmh": número|null, "cinemometro": "fijo|movil|tramo|null", "radar_nuevo": true|null, "limite_origen": "senalizado|generico|null"},
+ "velocidad": {"velocidad_medida_kmh": número|null, "limite_kmh": número|null, "via": "urbana|interurbana|travesia|null", "velocidad_corregida_kmh": número|null, "cinemometro": "fijo|movil|tramo|null", "radar_nuevo": true|null, "limite_origen": "senalizado|generico|null", "acceso_ciudad": true|null},
  "cargas": {"vehiculo_exclusivo_mercancias": true|false|null, "longitud_vehiculo_m": número|null, "ancho_vehiculo_m": número|null, "ancho_total_m": número|null, "direccion": "detras|delante|lateral|null", "sobresale_m": número|null, "indivisible": true|false|null, "tipo_carga": "longitud_indivisible|otra|null", "senal_v20": true|false|null, "luz": true|false|null, "visibilidad_reducida": true|false|null, "transporte_especial": true|false|null}
 }
 Reglas de extracción:
@@ -337,6 +337,7 @@ Reglas de extracción:
   "radar_nuevo": true solo si dicen que el radar es nuevo o está en su primer año de uso tras la verificación; en cualquier otro caso null.
   "limite_origen": "senalizado" si dicen que el límite lo fija una señal (vertical, marcas viales, panel) o es una limitación específica de un vehículo o de un conductor;
   "generico" si dicen que es el límite genérico de la vía (sin señal específica); null si no lo dicen.
+  "acceso_ciudad": true solo si dicen que es un tramo de autopista o autovía interurbana de acceso a una ciudad o una circunvalación con límite inferior a 100 km/h; en otro caso null.
 - CARGAS vs DIMENSIONES: una carga que SOBRESALE del vehículo (tabla de surf, barra, viga, bultos fuera de su proyección) es "cargas", NUNCA "dimensiones".
   "dimensiones" es solo para el largo, ancho o alto TOTAL del vehículo o conjunto (con su carga). Si no sabes si una medida es la longitud del vehículo o lo que sobresale, no la pongas en "dimensiones".
 - CARGAS (art. 15 RGC): "vehiculo_exclusivo_mercancias": true para camión o vehículo de carga; false para turismo y vehículos mixtos o de uso particular; null si no queda claro.
@@ -738,7 +739,7 @@ def obtener_indices_lexicos():
 INDICES_LEXICOS = obtener_indices_lexicos()
 
 RE_CALCULO = re.compile(
-    r"conduc|descans|paus|horas|minutos|tac[óo]graf|peso|pesa|kg|kilo|tonelad|\bt\b|mma|\beje|altur|\balto|anch|larg|longitud|metros|\bm\b|sobresal|baca|km/?h|velocid|radar|cinem",
+    r"conduc|descans|paus|horas|minutos|tac[óo]graf|peso|pesa|kg|kilo|tonelad|\bt\b|mma|\beje|altur|\balto|anch|larg|longitud|metros|\bm\b|sobresal|baca|km/?h|velocid|radar|cinem|l[ií]mit|limitad|tramo|urban|v[ií]a|autov|autopista|carretera|travesía|circunvalaci",
     re.I,
 )
 
@@ -785,6 +786,8 @@ Reglas:
 8. Si el bloque dice que no hay infracción o "No hay ficha aplicable", NO cites artículos, importes ni fichas que no estén en el propio bloque: da solo el resultado del cálculo.
 9. En "Responsable" copia exactamente lo que indique el bloque; no elijas tú entre varios responsables.
 10. Si el bloque contiene varias INFRACCIONES, preséntalas por separado, una lista por cada una.
+11. En velocidad, la línea "Cálculo:" debe decir SIEMPRE la velocidad medida, el margen del cinemómetro aplicado y la velocidad corregida, tal como figuran en el bloque.
+12. Si el bloque contiene "ALTERNATIVA ADMINISTRATIVA", presenta primero la vía penal y después esa alternativa con su ficha completa (cuantía y puntos), aclarando que se rellena por si se desestima la vía penal.
 """
 CONFIG_MODOS["CALCULO"] = {
     "prompt": INSTRUCCION_CALCULO, "top_k": 0, "max_tokens": 1800,
@@ -898,6 +901,8 @@ if pregunta_usuario:
                         st.text(texto_calc)
                 if resultado_calculo["estado"] == "faltan":
                     respuesta_directa = texto_faltan(texto_calc)  # pregunta directa: 0 llamadas al modelo
+                elif resultado_calculo.get("respuesta"):
+                    respuesta_directa = resultado_calculo["respuesta"]  # respuesta ya redactada por el cálculo (velocidad)
                 else:
                     prompt_actual = f"{texto_calc}\n\nPREGUNTA:\n{pregunta_usuario}"
             else:
