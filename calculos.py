@@ -24,7 +24,11 @@ def cargar_datos(carpeta: str = "datos"):
             velocidad = json.loads((base / "velocidad.json").read_text(encoding="utf-8"))
         except Exception:
             velocidad = None  # sin cuadro de velocidades, esa calculadora solo comprueba el umbral penal
-        return {"baremo": baremo, "trafico": trafico, "velocidad": velocidad}
+        try:
+            alcohol = json.loads((base / "alcohol.json").read_text(encoding="utf-8"))
+        except Exception:
+            alcohol = None
+        return {"baremo": baremo, "trafico": trafico, "velocidad": velocidad, "alcohol": alcohol}
     except Exception:
         return None
 
@@ -104,9 +108,14 @@ def _trafico(datos, norma: str, art_reg: str, opcion: str, apartado_reg: str = N
     return None
 
 
-def _resultado(estado, tipo, etiqueta, texto, respuesta=None):
-    """respuesta: texto ya redactado para el usuario; si existe, la app lo muestra tal cual, sin llamar al modelo."""
-    return {"estado": estado, "tipo": tipo, "etiqueta": etiqueta, "texto": texto, "respuesta": respuesta}
+def _resultado(estado, tipo, etiqueta, texto, respuesta=None, motivo=None):
+    """respuesta: texto ya redactado para el usuario; si existe, la app lo muestra tal cual, sin llamar al modelo.
+    motivo: para "sin_calculo", por qué no se usó la calculadora (se muestra en el debug)."""
+    return {"estado": estado, "tipo": tipo, "etiqueta": etiqueta, "texto": texto, "respuesta": respuesta, "motivo": motivo}
+
+
+def _sin_calculo(motivo):
+    return _resultado("sin_calculo", None, "", "", None, motivo)
 
 
 def _faltan(tipo, etiqueta, faltan, datos_conocidos=""):
@@ -758,8 +767,12 @@ def resolver_velocidad(p: dict, datos: dict) -> dict:
     etiqueta = "🧮 Cálculo: velocidad"
     v, lim, via, vc = p.get("velocidad_medida_kmh"), p.get("limite_kmh"), p.get("via"), p.get("velocidad_corregida_kmh")
     cin, nuevo, acceso = p.get("cinemometro"), bool(p.get("radar_nuevo")), bool(p.get("acceso_ciudad"))
-    if not v or not lim or v <= lim or not (datos.get("velocidad") or {}).get("graduacion"):
-        return _resultado("sin_calculo", None, "", "")
+    if not (datos.get("velocidad") or {}).get("graduacion"):
+        return _sin_calculo("no se cargó datos/velocidad.json: falta el archivo junto a app.py, en la carpeta datos/")
+    if not v or not lim:
+        return _sin_calculo("faltan la velocidad medida o el límite")
+    if v <= lim:
+        return _sin_calculo(f"la velocidad medida ({v:g}) no supera el límite ({lim:g})")
     lim_eff = 100 if (acceso and lim < 100) else lim  # en accesos a ciudad los efectos penales cuentan desde 100 km/h
     conocidos = f"velocidad medida {v:g} km/h, límite {lim:g} km/h (exceso medido {v - lim:g} km/h)"
 
@@ -776,7 +789,7 @@ def resolver_velocidad(p: dict, datos: dict) -> dict:
     else:
         pos = correcciones_posibles(datos, v)
         if not pos:
-            return _resultado("sin_calculo", None, "", "")
+            return _sin_calculo("velocidad.json no trae la tabla de márgenes")
         c_ref, _ = corregir_velocidad(datos, v, "fijo", False)
         vc_ref = c_ref if c_ref is not None else pos[0]
         vcs = pos
@@ -814,7 +827,7 @@ def resolver_velocidad(p: dict, datos: dict) -> dict:
                       "Si quieres el dato exacto, indica el tipo de radar.")
     admin = _bloque_admin(datos, p, vc_ref, lim, via, acceso, de_tramo)
     if admin is None:
-        return _resultado("sin_calculo", None, "", "")  # límite que no figura en el cuadro: flujo normal
+        return _sin_calculo(f"el límite de {lim:g} km/h no figura en el cuadro del Anexo IV")  # flujo normal
     alt, avisos_alt, info = admin
     avisos += avisos_alt
 
@@ -850,12 +863,349 @@ def resolver_velocidad(p: dict, datos: dict) -> dict:
     return _resultado("completo", "velocidad", etiqueta, "\n".join(lineas), respuesta)
 
 
+# ------------------------------------------------------------------
+# Lector de velocidad directamente del texto (sin IA): es el caso más frecuente y no debe depender del modelo
+# ------------------------------------------------------------------
+_RE_LIMITE = [
+    re.compile(r"limitad[oa]s?\s*(?:la\s+velocidad\s*)?(?:a|en|hasta)?\s*(\d{2,3})\b", re.I),
+    re.compile(r"l[ií]mite\s+(?:\w+\s+){0,2}?(?:de|es|era|a|:)?\s*(\d{2,3})\b", re.I),
+    re.compile(r"velocidad\s+m[aá]xima(?:\s+permitida)?\s*(?:de|es|era|:)?\s*(\d{2,3})\b", re.I),
+    re.compile(r"permitid[ao]s?\s*(?:es|son|de|:)?\s*(\d{2,3})\b", re.I),
+    re.compile(r"(?:v[ií]a|tramo|zona|carretera|calle|autov[ií]a|autopista|traves[ií]a|urbano|urbana|interurbano|interurbana)\s+(?:de\s+)?(\d{2,3})\b", re.I),
+]
+_RE_CORREGIDA = [re.compile(r"corregid[ao]s?\s*(?:de|a|es|:)?\s*(\d{2,3})\b", re.I),
+                 re.compile(r"(\d{2,3})\s*(?:km/?h)?\s*(?:ya\s+)?corregid", re.I)]
+_RE_NUM = re.compile(r"(?<![\d.,])(\d{2,3})(?![\d])(?:[.,]\d+)?")
+_RE_OTRA_UNIDAD = re.compile(r"\s*(?:metros?|m\b|kg|kilos?|tonelad|t\b|a[ñn]os?|puntos?|€|euros?|%|horas?|minutos?|min\b|cm\b|plazas?|mg)", re.I)
+_RE_NO_VELOCIDAD = re.compile(r"\b(?:kg|kilos|tonelad\w*|mma|descansa\w*|tac[oó]graf\w*)\b|conducci[oó]n continua|horas de conducci", re.I)
+
+
+def _lee_parcial(texto: str) -> dict:
+    """Lee lo que haya en un mensaje, sin exigir que esté completo."""
+    t = texto or ""
+    out = {"limite_kmh": None, "velocidad_medida_kmh": None, "velocidad_corregida_kmh": None}
+    span_lim = None
+    for rx in _RE_LIMITE:
+        m = rx.search(t)
+        if m and 10 <= int(m.group(1)) <= 140:
+            out["limite_kmh"], span_lim = int(m.group(1)), m.span(1)
+            break
+    span_corr = None
+    for rx in _RE_CORREGIDA:
+        m = rx.search(t)
+        if m:
+            out["velocidad_corregida_kmh"], span_corr = int(m.group(1)), m.span(1)
+            break
+    cand = []
+    for m in _RE_NUM.finditer(t):
+        n, sp = int(m.group(1)), m.span(1)
+        if sp == span_lim or sp == span_corr or not (20 <= n <= 350):
+            continue
+        resto = t[m.end():m.end() + 14]
+        if _RE_OTRA_UNIDAD.match(resto) and not re.match(r"\s*km", resto, re.I):
+            continue
+        con_unidad = bool(re.match(r"\s*(?:km/?h|kil[oó]metros)", resto, re.I))
+        cand.append((0 if con_unidad else 1, m.start(), n))
+    lim = out["limite_kmh"]
+    cand = [c for c in cand if lim is None or c[2] > lim]
+    if cand and lim is not None:
+        out["velocidad_medida_kmh"] = sorted(cand)[0][2]
+    low = t.lower()
+    if re.search(r"interurban|carretera|autov[ií]a|autopista|nacional|comarcal", low) and not re.search(r"\burban[oa]\b", low):
+        out["via"] = "interurbana"
+    elif re.search(r"interurban", low):
+        out["via"] = "interurbana"
+    elif re.search(r"traves[ií]a", low):
+        out["via"] = "travesia"
+    elif re.search(r"urban|poblad|ciudad|\bcalle\b", low):
+        out["via"] = "urbana"
+    else:
+        out["via"] = None
+    if re.search(r"(?:radar|cinem[oó]metro)\s+de\s+tramo|velocidad\s+media|control\s+de\s+tramo", low):
+        out["cinemometro"] = "tramo"
+    elif re.search(r"(?:radar|cinem[oó]metro)\s+m[oó]vil|m[oó]vil\s+(?:de\s+)?(?:radar|cinem)", low):
+        out["cinemometro"] = "movil"
+    elif re.search(r"(?:radar|cinem[oó]metro)\s+fijo|\bfijo\b", low):
+        out["cinemometro"] = "fijo"
+    else:
+        out["cinemometro"] = None
+    out["radar_nuevo"] = True if re.search(r"radar\s+nuevo|nuevo\s+radar|primer\s+a[ñn]o", low) else None
+    out["acceso_ciudad"] = True if re.search(r"\bacceso\b|\baccesos\b|circunvalaci", low) else None
+    if re.search(r"se[ñn]al|panel|cartel", low):
+        out["limite_origen"] = "senalizado"
+    elif re.search(r"gen[eé]ric", low):
+        out["limite_origen"] = "generico"
+    else:
+        out["limite_origen"] = None
+    return out
+
+
+def extraer_velocidad_conversacion(pregunta: str, previos_usuario: list, calculo_reciente: bool = False):
+    """Devuelve el dict 'velocidad' para resolver_velocidad, o None si el mensaje no es un caso de velocidad.
+    Si el mensaje actual no trae velocidad y límite pero el cálculo anterior era de velocidad ("radar fijo", "urbana"...),
+    completa lo que falte con los mensajes anteriores del agente."""
+    if _RE_NO_VELOCIDAD.search(pregunta or ""):
+        return None
+    actual = _lee_parcial(pregunta)
+    if actual["velocidad_medida_kmh"] and actual["limite_kmh"]:
+        base = actual
+    elif calculo_reciente and previos_usuario:
+        base = dict(actual)
+        for texto in reversed(previos_usuario[-3:]):
+            ant = _lee_parcial(texto)
+            if ant["velocidad_medida_kmh"] and ant["limite_kmh"]:
+                for k, v in ant.items():
+                    if base.get(k) in (None, False):
+                        base[k] = v
+                break
+    else:
+        return None
+    if not (base.get("velocidad_medida_kmh") and base.get("limite_kmh")) or base["velocidad_medida_kmh"] <= base["limite_kmh"]:
+        return None
+    return {k: v for k, v in base.items() if v is not None}
+
+
+# ==================================================================
+# 6. ALCOHOLEMIA (aire espirado): art. 20 RGC + umbral penal (art. 379.2 CP)
+# ==================================================================
+import math
+
+
+def _mgl(x: float) -> str:
+    return f"{x:.3f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def _suelo3(x: float) -> float:
+    return math.floor(round(x * 1000, 6)) / 1000
+
+
+def _corregir_alcohol(cfg, m, fijo=None):
+    fijo = cfg["fijo_mgl"] if fijo is None else fijo
+    if m <= cfg["hasta_mgl"]:
+        return _suelo3(m - fijo)
+    return _suelo3(m * (1 - cfg["porcentaje"] / 100))
+
+
+def _nivel_alcohol(corr, limite):
+    if corr > 2 * limite:
+        return "alto"
+    if corr > limite:
+        return "bajo"
+    return None
+
+
+def _ficha_alcohol(datos, opcion):
+    for f in datos["trafico"]:
+        if f["norma"] == "CIR LSV" and f["art_reg"] == "020" and f["apartado_reg"] == "1" \
+                and f["opcion"] == opcion and "AIRE ESPIRADO" in f["hecho"]:
+            return f
+    return None
+
+
+def _hecho_corto(h: str) -> str:
+    return re.sub(r"\s*\(.*$", "", h).strip().rstrip(".") + "."
+
+
+NOMBRE_CONDUCTOR = {"general": "conductor en general (límite 0,25 mg/l)",
+                    "profesional_novel": "conductor profesional, novel o de transporte especial (límite 0,15 mg/l)"}
+
+
+def resolver_alcohol(p: dict, datos: dict) -> dict:
+    etiqueta = "🧮 Cálculo: alcoholemia"
+    alc = datos.get("alcohol")
+    if not alc:
+        return _sin_calculo("no se cargó datos/alcohol.json: falta el archivo junto a app.py, en la carpeta datos/")
+    meds = [float(x) for x in (p.get("mediciones_mgl") or []) if x is not None and 0 < float(x) <= 5]
+    if not meds:
+        return _sin_calculo("no hay ninguna tasa en mg/l")
+    m = min(meds)
+    cfg = alc["margenes"]["en_servicio"]
+    conocidos = "tasa(s) medida(s) " + " y ".join(_mgl(x) for x in meds) + " mg/l"
+
+    # --- tasa corregida: aportada, calculada con el margen, o comprobada con el rango plausible ---
+    tc = p.get("tasa_corregida_mgl")
+    if tc:
+        corrs, corr_ref, txt_margen = [float(tc)], float(tc), "tasa corregida aportada por el agente"
+    elif m > cfg["hasta_mgl"]:
+        corr_ref = _corregir_alcohol(cfg, m)
+        corrs = [corr_ref]
+        txt_margen = f"etilómetro en servicio, {cfg['porcentaje']:g} % por encima de {_mgl(cfg['hasta_mgl'])} mg/l (Orden ITC/3707/2006)"
+    else:
+        corr_ref = _corregir_alcohol(cfg, m)
+        corrs = sorted({_corregir_alcohol(cfg, m), _corregir_alcohol(cfg, m, alc["margenes"]["plausible_minimo_fijo_mgl"])})
+        txt_margen = (f"etilómetro en servicio, {_mgl(cfg['fijo_mgl'])} mg/l hasta {_mgl(cfg['hasta_mgl'])} mg/l (Orden ITC/3707/2006)"
+                      + ("" if cfg["confirmado_fijo"] else " [margen sin confirmar en la app]"))
+
+    # --- tipo de conductor ---
+    cond = p.get("conductor")
+    conductores = [cond] if cond in alc["limites_mgl"] else list(alc["limites_mgl"])
+    reinc = p.get("reincidente")
+
+    # ¿el resultado es el mismo con todos los márgenes y tipos de conductor posibles?
+    niveles = {(c, x): _nivel_alcohol(x, alc["limites_mgl"][c]) for c in conductores for x in corrs}
+    if len({niveles[(c, x)] for c in conductores for x in corrs}) > 1:
+        if len({niveles[(cond_, x)] for cond_ in conductores for x in corrs if True}) > 1 and len(corrs) > 1 and len(conductores) == 1:
+            return _faltan("alcohol", etiqueta, ["la tasa corregida, es decir, la medida menos el margen del etilómetro según su certificado: "
+                                                 "el margen cambia el tramo de la sanción"], conocidos)
+        if len(conductores) > 1 and all(len({niveles[(c, x)] for x in corrs}) == 1 for c in conductores):
+            return _faltan("alcohol", etiqueta, ["si el conductor es en general o profesional, novel, de urgencia o de mercancías peligrosas "
+                                                 "(los límites son 0,25 y 0,15 mg/l y cambia el tramo)"], conocidos)
+        return _faltan("alcohol", etiqueta, ["la tasa corregida (la medida menos el margen del etilómetro) y si el conductor es en general o profesional/novel: "
+                                             "con los datos actuales cambia el tramo de la sanción"], conocidos)
+    c_ref = conductores[0] if len(conductores) == 1 else "general"
+    limite = alc["limites_mgl"][c_ref]
+    nivel = niveles[(c_ref, corrs[0])]
+
+    # --- vía penal (norma del RAG) ---
+    pen = alc["penal"]
+    objetivo = m >= pen["objetivo_min_medida_mgl"]
+    ba, bb = pen["banda_sintomas_mgl"]
+    banda = ba <= m <= bb
+    sintomas = p.get("sintomas")
+    delito = objetivo or (banda and sintomas is True)
+
+    def info_admin():
+        if nivel is None:
+            return None
+        ops = alc["opciones"][c_ref]
+        opcion = ops["alto"] if nivel == "alto" else (ops["bajo_reincidente"] if reinc is True else ops["bajo"])
+        f = _ficha_alcohol(datos, opcion)
+        if not f:
+            return None
+        return {"opcion": opcion, "ficha": f, "multa": f["multa"], "puntos": int(re.sub(r"\D", "", f["puntos"]) or 0), "nivel": nivel}
+
+    info = info_admin()
+
+    def resumen():
+        if info is None:
+            return f"Tasa medida {_mgl(m)} mg/l · tasa corregida {_mgl(corr_ref)} mg/l · sin infracción administrativa por alcohol"
+        return (f"Tasa medida {_mgl(m)} mg/l · tasa corregida {_mgl(corr_ref)} mg/l · cuantía {info['multa']:g} € "
+                f"(reducida {info['multa'] / 2:g} €) · {info['puntos']} puntos")
+
+    def cuerpo(con_ficha=True):
+        l = [f"- Conductor: {NOMBRE_CONDUCTOR[c_ref]}" + ("" if len(conductores) == 1 else " (no se indicó; con 0,15 mg/l de límite el tramo es el mismo)"),
+             "- Mediciones: " + (" y ".join(_mgl(x) for x in meds) + f" mg/l → se toma la menor ({_mgl(m)}), como indican las fichas"
+                                if len(meds) > 1 else f"{_mgl(m)} mg/l"),
+             f"- Margen del etilómetro: {txt_margen}",
+             f"- Límite: {_mgl(limite)} mg/l (doble: {_mgl(2 * limite)} mg/l)"]
+        if info is None:
+            l.append(f"- La tasa corregida ({_mgl(corr_ref)} mg/l) no supera {_mgl(limite)} mg/l: sin infracción administrativa por alcohol.")
+            return l
+        f = info["ficha"]
+        cal = f["calificacion"] + (f" (art. {re.sub(r'^0+', '', f['art_sancionador'])} LSV)" if f["art_sancionador"] else "")
+        l += [f"- Norma y artículo / Precepto: {_precepto(f)} · opción {info['opcion']}",
+              f"- Infracción: {_hecho_corto(f['hecho'])}",
+              f"- Calificación: {cal}",
+              f"- Cuantía: {info['multa']:g} €",
+              f"- Cuantía reducida: {info['multa'] / 2:g} €",
+              f"- Puntos: {info['puntos']}",
+              f"- Responsable: {f['responsable']}"]
+        if nivel == "bajo" and reinc is not True:
+            ops = alc["opciones"][c_ref]
+            fr = _ficha_alcohol(datos, ops["bajo_reincidente"])
+            if fr:
+                l.append(f"- Nota: si consta sanción firme por el art. 20 en el año anterior a los hechos, la cuantía es de {fr['multa']:g} € "
+                         f"con {re.sub(chr(92) + 'D', '', fr['puntos']) or fr['puntos']} puntos (opción {ops['bajo_reincidente']}).")
+        if nivel == "bajo" and reinc is True:
+            l.append("- Nota: se aplica la cuantía de reincidencia (sanción firme por el art. 20 en el año anterior a los hechos).")
+        l.append("- Nota: posible inmovilización del vehículo (art. 104.1.d LSV: pruebas con resultado positivo); la retirada y el depósito solo en los casos del art. 105.")
+        return l
+
+    bloque_modelo = ["RESULTADO DEL CÁLCULO (verificado por código)", "Tipo de cálculo: alcoholemia en aire espirado",
+                     f"Tasa medida (la menor): {_mgl(m)} mg/l · margen: {txt_margen} · tasa corregida: {_mgl(corr_ref)} mg/l"]
+    if delito:
+        motivo = (f"La menor de las mediciones ({_mgl(m)} mg/l) es de al menos {_mgl(pen['objetivo_min_medida_mgl'])} mg/l: tasa objetiva superior a 0,60 mg/l "
+                  "tras descontar el error del etilómetro." if objetivo else
+                  f"Tasa entre {_mgl(ba)} y {_mgl(bb)} mg/l con sintomatología o conducción anómala: influencia del alcohol en la conducción.")
+        cab = [f"**Vía penal: presunto delito del art. 379.2 CP.** {motivo} Procede el atestado por presunto delito contra la seguridad vial.", "",
+               "**Alternativa administrativa** (se rellena por si se desestima la vía penal; la penal prevalece):", ""]
+        respuesta = "\n".join(cab + [f"**{resumen()}**", ""] + cuerpo())
+        return _resultado("completo", "alcohol", etiqueta, "\n".join(bloque_modelo + [respuesta]), respuesta)
+    extra = []
+    if banda and sintomas is None:
+        extra.append(f"- Nota penal: con tasas entre {_mgl(ba)} y {_mgl(bb)} mg/l puede haber delito (art. 379.2 CP) si hay sintomatología o conducción anómala "
+                     "(maniobras anómalas, accidente, signos externos). Si los hay, indícalo y se tramita por vía penal.")
+    if objetivo is False and m > bb:
+        pass
+    respuesta = "\n".join([f"**{resumen()}**", ""] + cuerpo() + extra)
+    return _resultado("completo", "alcohol", etiqueta, "\n".join(bloque_modelo + [respuesta]), respuesta)
+
+
+# ------------------------------------------------------------------
+# Lector de alcoholemia directamente del texto (sin IA)
+# ------------------------------------------------------------------
+_RE_ALC_CONTEXTO = re.compile(r"alcohol|etil[oó]metro|alcoholemia|soplar|sopl[oó]|aire espirado|mg/?l|tasa", re.I)
+_RE_ALC_NUM = re.compile(r"(?<![\d.,])(\d[.,]\d{1,3}|[.,]\d{1,3})(?![\d])\s*(mg/?l|mg|miligramos?|g/?l|gr/?l|gramos?|g\b)?", re.I)
+
+
+def _lee_parcial_alcohol(texto: str) -> dict:
+    t = texto or ""
+    out = {"mediciones_mgl": [], "conductor": None, "reincidente": None, "sintomas": None, "tasa_corregida_mgl": None}
+    mc = re.search(r"corregid[ao]s?\s*(?:de|a|es|:)?\s*(\d?[.,]\d{1,3})", t, re.I) or re.search(r"(\d?[.,]\d{1,3})\s*(?:mg/?l)?\s*(?:ya\s+)?corregid", t, re.I)
+    corr_span = mc.span(1) if mc else None
+    if mc:
+        out["tasa_corregida_mgl"] = float(mc.group(1).replace(",", "."))
+    sangre = False
+    for m in _RE_ALC_NUM.finditer(t):
+        if corr_span and m.span(1) == corr_span:
+            continue
+        unidad = (m.group(2) or "").lower()
+        if unidad.startswith(("g/", "gr", "gramo")) or unidad == "g":
+            sangre = True
+            continue
+        v = float(m.group(1).replace(",", "."))
+        if 0 < v <= 5 and (unidad.startswith(("mg", "miligramo")) or re.search(r"alcohol|etil|soplar|tasa|alcoholemia", t, re.I)):
+            resto = t[m.end():m.end() + 12]
+            if re.match(r"\s*(?:km|m\b|metros|kg|%|euros|€|h\b|horas)", resto, re.I):
+                continue
+            out["mediciones_mgl"].append(v)
+    out["sangre"] = sangre
+    low = t.lower()
+    if re.search(r"profesional|novel|autob[uú]s|autocar|escolar|mercanc[ií]as peligrosas|urgencia|ambulancia|transporte especial", low):
+        out["conductor"] = "profesional_novel"
+    elif re.search(r"conductor general|\bgeneral\b|particular", low):
+        out["conductor"] = "general"
+    if re.search(r"reincident|sanci[oó]n firme|sancionad[oa]\s+(?:por\s+alcohol\s+)?(?:en|durante)\s+el\s+[uú]ltimo\s+a[ñn]o", low):
+        out["reincidente"] = True
+    elif re.search(r"sin antecedentes|primera vez|no (?:es )?reincident", low):
+        out["reincidente"] = False
+    if re.search(r"s[ií]ntomas|signos|inestab|aliento|maniobra|accidente|colisi[oó]n|conducci[oó]n an[oó]mala|zigzag|ojos", low) \
+            and not re.search(r"sin s[ií]ntomas|sin signos|no present\w+ s[ií]ntomas", low):
+        out["sintomas"] = True
+    return out
+
+
+def extraer_alcohol_conversacion(pregunta: str, previos_usuario: list, calculo_reciente: bool = False):
+    """Devuelve el dict 'alcohol' para resolver_alcohol, o None si el mensaje no es un caso de alcohol en aire espirado."""
+    t = pregunta or ""
+    if re.search(r"km/?h|kilogramos|\bkg\b|\bMMA\b|tonelad", t, re.I):
+        return None
+    actual = _lee_parcial_alcohol(t) if _RE_ALC_CONTEXTO.search(t) else None
+    if actual and actual["mediciones_mgl"] and not actual["sangre"]:
+        base = actual
+    elif calculo_reciente and previos_usuario:
+        base = dict(actual or _lee_parcial_alcohol(t))
+        for texto in reversed(previos_usuario[-3:]):
+            ant = _lee_parcial_alcohol(texto)
+            if ant["mediciones_mgl"] and not ant["sangre"]:
+                for k, v in ant.items():
+                    if base.get(k) in (None, False, []):
+                        base[k] = v
+                break
+    else:
+        return None
+    if not base.get("mediciones_mgl") or base.get("sangre"):
+        return None
+    base = {k: v for k, v in base.items() if v not in (None, []) and k != "sangre"}
+    return base
+
+
 # ==================================================================
 # Entrada única
 # ==================================================================
 def calcular(extraccion: dict, datos: dict) -> dict:
     tipo = (extraccion or {}).get("calculo")
-    if datos is None or tipo not in ("tiempos", "masas", "dimensiones", "cargas", "velocidad"):
+    if datos is None or tipo not in ("tiempos", "masas", "dimensiones", "cargas", "velocidad", "alcohol"):
         return _resultado("sin_calculo", None, "", "")
     if tipo == "tiempos":
         return resolver_tiempos(extraccion.get("tiempos") or {}, datos)
@@ -865,4 +1215,6 @@ def calcular(extraccion: dict, datos: dict) -> dict:
         return resolver_cargas(extraccion.get("cargas") or {}, datos)
     if tipo == "velocidad":
         return resolver_velocidad(extraccion.get("velocidad") or {}, datos)
+    if tipo == "alcohol":
+        return resolver_alcohol(extraccion.get("alcohol") or {}, datos)
     return resolver_dimensiones(extraccion.get("dimensiones") or {}, datos)
