@@ -1,0 +1,40 @@
+{
+ "fuente": "Fichas del art. 20 RGC (codificado de tráfico), Orden ITC/3707/2006 (márgenes, citada en la ficha 5E) y norma penal del RAG del usuario.",
+ "limites_mgl": {
+  "general": 0.25,
+  "profesional_novel": 0.15
+ },
+ "penal": {
+  "objetivo_min_medida_mgl": 0.66,
+  "banda_sintomas_mgl": [
+   0.4,
+   0.65
+  ],
+  "nota": "Doctrina del TS recogida en el RAG: para imputar el delito solo por la cifra, la menor de las mediciones del etilómetro evidencial debe ser de al menos 0,66 mg/l; entre 0,40 y 0,65 mg/l hace falta probar la influencia."
+ },
+ "opciones": {
+  "general": {
+   "bajo": "5E",
+   "bajo_reincidente": "5M",
+   "alto": "5I"
+  },
+  "profesional_novel": {
+   "bajo": "5G",
+   "bajo_reincidente": "5Ñ",
+   "alto": "5K"
+  }
+ },
+ "margenes": {
+  "activo": true,
+  "nota": "Orden ITC/3707/2006, art. 9 y Anexo II 2.3. El 7,5 % por encima de 0,400 mg/l figura en la norma penal del RAG (confirmado). El margen absoluto de 0,032 mg/l hasta 0,400 mg/l es de memoria y está SIN CONFIRMAR: mientras tanto la app solo responde si el resultado es el mismo con cualquier margen plausible (0,020 a 0,032); si no, pide la tasa corregida.",
+  "redondeo": "abajo, a 3 decimales",
+  "en_servicio": {
+   "hasta_mgl": 0.4,
+   "fijo_mgl": 0.032,
+   "porcentaje": 7.5,
+   "confirmado_fijo": false,
+   "confirmado_porcentaje": true
+  },
+  "plausible_minimo_fijo_mgl": 0.02
+ }
+}
