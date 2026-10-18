@@ -104,8 +104,9 @@ def _trafico(datos, norma: str, art_reg: str, opcion: str, apartado_reg: str = N
     return None
 
 
-def _resultado(estado, tipo, etiqueta, texto):
-    return {"estado": estado, "tipo": tipo, "etiqueta": etiqueta, "texto": texto}
+def _resultado(estado, tipo, etiqueta, texto, respuesta=None):
+    """respuesta: texto ya redactado para el usuario; si existe, la app lo muestra tal cual, sin llamar al modelo."""
+    return {"estado": estado, "tipo": tipo, "etiqueta": etiqueta, "texto": texto, "respuesta": respuesta}
 
 
 def _faltan(tipo, etiqueta, faltan, datos_conocidos=""):
@@ -587,8 +588,6 @@ def resolver_cargas(p: dict, datos: dict) -> dict:
 # 5. VELOCIDAD: umbral penal (art. 379.1 CP) + graduación administrativa (cuadro DGT)
 # ==================================================================
 UMBRAL_PENAL = {"urbana": 60, "interurbana": 80, "travesia": 80}   # km/h sobre el límite (travesías: criterio de vía interurbana)
-HOLGURA_EMP = 0.15   # si para evitar el delito habría que restar más del 15 % de la velocidad leída, se considera
-                     # evidente (ningún cinemómetro tiene un error máximo permitido tan alto). Ajústalo a tus tablas.
 OPCION_PUNTUAL = {100: "5M", 300: "5I", 400: "5G", 500: "5E", 600: "5A"}
 OPCION_TRAMO = {100: "5N", 300: "5J", 400: "5H", 500: "5F", 600: "5B"}
 OPCION_ACCESO_PUNTUAL = {600: "5C"}   # el resto (100-500 €) es la 5K, de importe variable
@@ -607,6 +606,17 @@ def corregir_velocidad(datos, v, cinemometro, nuevo=False):
     if v <= cfg["hasta_kmh"]:
         return v - cfg["fijo_kmh"], f"margen de cinemómetro {cinemometro} {etapa}: {cfg['fijo_kmh']} km/h (hasta {cfg['hasta_kmh']} km/h)"
     return int(v * (1 - cfg["porcentaje"] / 100)), f"margen de cinemómetro {cinemometro} {etapa}: {cfg['porcentaje']} % (por encima de {cfg['hasta_kmh']} km/h), redondeado hacia abajo"
+
+
+def _corregir_cfg(cfg, v):
+    return v - cfg["fijo_kmh"] if v <= cfg["hasta_kmh"] else int(v * (1 - cfg["porcentaje"] / 100))
+
+
+def correcciones_posibles(datos, v):
+    """Velocidades corregidas con TODOS los márgenes de la tabla (fijo/móvil/tramo, nuevo/en servicio).
+    Sirve para comprobar si el resultado es el mismo con cualquier radar, sin preguntar el tipo."""
+    m = ((datos or {}).get("velocidad") or {}).get("margenes") or {}
+    return sorted({_corregir_cfg(cfg, v) for etapas in (m.get("tipos") or {}).values() for cfg in etapas.values()})
 
 
 def tramo_velocidad(datos, limite, v_corr):
@@ -629,9 +639,9 @@ def _ficha_velocidad(datos, opcion, art="052"):
 
 ARTICULO_GENERICO = {"urbana": "050", "travesia": "050", "interurbana": "048"}
 CRITERIO_ARTICULO = {
-    "048": "límite genérico de vías interurbanas (fuera de poblado)",
-    "050": "límite genérico en poblado: calles urbanas y travesías",
-    "052": "límite fijado por señal (vertical, marcas viales o panel) o limitación específica de un vehículo o de un conductor",
+    "048": "genérico interurbano",
+    "050": "genérico en poblado y travesías",
+    "052": "límite por señal o limitación específica",
 }
 
 
@@ -658,107 +668,186 @@ def _precepto(f):
     return f"Art. {_num(f['art_reg'])}.{ap} RGC · Art. {_num(f['art_lsv'])}.{f['apartado_lsv']} LSV"
 
 
-def resolver_velocidad(p: dict, datos: dict) -> dict:
-    etiqueta = "🧮 Cálculo: velocidad"
-    v, lim, via, vc = p.get("velocidad_medida_kmh"), p.get("limite_kmh"), p.get("via"), p.get("velocidad_corregida_kmh")
-    cin, nuevo = p.get("cinemometro"), bool(p.get("radar_nuevo"))
-    if not v or not lim or v <= lim:
-        return _resultado("sin_calculo", None, "", "")
-    exceso = v - lim
-    conocidos = f"velocidad medida {v:g} km/h, límite {lim:g} km/h (exceso medido {exceso:g} km/h)"
-
-    # ¿Hay margen que restar automáticamente?
-    txt_margen = None
-    if not vc and cin in ("fijo", "movil", "tramo"):
-        vc, txt_margen = corregir_velocidad(datos, v, cin, nuevo)
-
-    # --- 1. umbral penal ---
-    if exceso > min(UMBRAL_PENAL.values()):
-        if via not in UMBRAL_PENAL:
-            return _faltan("velocidad", etiqueta, ["si es vía urbana, interurbana o travesía (el umbral penal es +60 km/h en urbana y +80 km/h en interurbana)"], conocidos)
-        umbral = UMBRAL_PENAL[via]
-        if exceso > umbral:
-            nombre_via = {"urbana": "urbana", "interurbana": "interurbana", "travesia": "travesía (se aplica el umbral de vía interurbana)"}[via]
-            cab = ["RESULTADO DEL CÁLCULO (verificado por código; no recalcules ni cambies estas cifras)",
-                   "Tipo de cálculo: velocidad, umbral penal del art. 379.1 CP",
-                   f"Velocidad medida: {v:g} km/h · límite: {lim:g} km/h · vía {nombre_via} · umbral penal: más de {umbral} km/h sobre el límite"]
-            delito = None
-            if vc:
-                exceso_c = vc - lim
-                cab.append(f"Velocidad corregida: {vc:g} km/h" + (f" ({txt_margen})" if txt_margen else " (aportada)") + f" → exceso corregido {exceso_c:g} km/h")
-                if exceso_c > umbral:
-                    cab.append(f"RESULTADO: el exceso corregido ({exceso_c:g} km/h) supera el umbral de {umbral} km/h: PRESUNTO DELITO del art. 379.1 CP.")
-                    delito = True
-                else:
-                    delito = False  # tras el margen no llega: vía administrativa
-            else:
-                margen_necesario = exceso - umbral
-                cab.append(f"Exceso medido (sin corregir): {exceso:g} km/h. Para que NO fuese delito habría que restar un margen de más de "
-                           f"{margen_necesario:g} km/h ({margen_necesario / v * 100:.0f} % de la velocidad leída).")
-                if margen_necesario > HOLGURA_EMP * v:
-                    cab.append("RESULTADO: ese margen es muy superior al error máximo permitido de cualquier cinemómetro: PRESUNTO DELITO del art. 379.1 CP "
-                               "(el EMP exacto del equipo se aplicará en el atestado, pero no puede cambiar el resultado).")
-                    delito = True
-                else:
-                    return _faltan("velocidad", etiqueta, [
-                        "la velocidad corregida, es decir, la leída menos el margen (EMP) del cinemómetro según su certificado: "
-                        "el exceso está cerca del umbral penal y el margen decide si es delito"], conocidos)
-            if delito:
-                cab += [
-                    "Consecuencia: no se formula multa administrativa por este hecho; procede el atestado y el traslado por presunto delito contra la seguridad vial.",
-                    "Criterio del RAG: el delito solo existe si la velocidad neta, tras restar el EMP, supera el umbral (+61 km/h en urbana, +81 km/h en interurbana).",
-                    "AVISOS: no cites la ficha del art. 52 como sanción de este hecho.",
-                ]
-                return _resultado("completo", "velocidad", etiqueta, "\n".join(cab))
-            # delito descartado tras el margen: se sigue con la graduación administrativa
-
-    # --- 2. graduación administrativa (cuadro DGT) ---
-    if not (datos.get("velocidad") or {}).get("graduacion"):
-        return _resultado("sin_calculo", None, "", "")
-    if not vc:
-        if cin in ("fijo", "movil", "tramo"):
-            return _faltan("velocidad", etiqueta, [
-                f"la velocidad corregida, es decir, la leída menos el margen del cinemómetro {cin} según su certificado "
-                "(la app no tiene confirmado el margen de ese tipo de radar)"], conocidos)
-        return _faltan("velocidad", etiqueta, [
-            "el tipo de cinemómetro (fijo, móvil o de tramo) o directamente la velocidad corregida tras restar su margen"], conocidos)
+def _bloque_admin(datos, p, vc, lim, via, acceso, de_tramo):
+    """Graduación administrativa para la velocidad corregida vc. Devuelve (lineas_para_el_modelo, avisos, info) o None.
+    info = None si no hay infracción; si la hay, un dict con los datos para redactar la respuesta."""
     tramo = tramo_velocidad(datos, lim, vc)
     if tramo == "sin_tabla":
-        return _resultado("sin_calculo", None, "", "")  # límite que no figura en el cuadro: flujo normal
-    lineas = ["RESULTADO DEL CÁLCULO (verificado por código; no recalcules ni cambies estas cifras)",
-              "Tipo de cálculo: velocidad, graduación de la sanción (cuadro de velocidades de la DGT)",
-              f"Velocidad medida: {v:g} km/h · velocidad corregida: {vc:g} km/h" + (f" ({txt_margen})" if txt_margen else " (aportada)") + f" · límite: {lim:g} km/h"]
+        return None
     if tramo is None:
-        lineas.append("RESULTADO: tras restar el margen la velocidad no supera el primer tramo del cuadro para ese límite: sin infracción por velocidad.")
-        lineas.append("No hay ficha aplicable: no cites artículos ni importes.")
-        return _resultado("completo", "velocidad", etiqueta, "\n".join(lineas))
+        return ["RESULTADO: tras restar el margen la velocidad no supera el primer tramo del cuadro para ese límite: sin infracción por velocidad.",
+                "No hay ficha aplicable: no cites artículos ni importes."], [], None
     multa, pts = tramo["multa"], tramo["puntos"]
     rango = f"{tramo['desde']} a {tramo['hasta']} km/h" if tramo["hasta"] else f"{tramo['desde']} km/h en adelante"
-    lineas.append(f"Tramo del cuadro para límite {lim:g}: {rango} → {multa} € · {pts} puntos · {tramo['calificacion']}")
-    de_tramo = cin == "tramo"
-    opcion = (OPCION_TRAMO if de_tramo else OPCION_PUNTUAL)[multa]
+    avisos, nota_puntos = [], None
+    if acceso and lim < 100:
+        # Anexo IV: en autovías/autopistas interurbanas de acceso a ciudades con límite inferior a 100, la multa es la del cuadro
+        # del límite, pero los demás efectos (puntos, penales) solo se producen por encima de 100 km/h y según el límite de 100
+        t100 = tramo_velocidad(datos, 100, vc) if vc > 100 else None
+        pts = t100["puntos"] if t100 else 0
+        opcion = (OPCION_ACCESO_TRAMO if de_tramo else OPCION_ACCESO_PUNTUAL).get(multa, "5L" if de_tramo else "5K")
+        nota_puntos = ("Tramo de acceso a ciudad con límite inferior a 100 km/h (Anexo IV): la multa es la del cuadro del límite "
+                       f"{lim:g}; los puntos y demás efectos solo cuentan por encima de 100 km/h, según el cuadro del límite 100"
+                       + (f" ({vc:g} km/h → {pts} puntos)." if vc > 100 else " (no supera 100 km/h: 0 puntos)."))
+        lineas = [f"Tramo del cuadro para límite {lim:g}: {rango} → {multa} € (multa del cuadro del límite {lim:g})",
+                  f"Puntos: {pts} ({nota_puntos})"]
+    else:
+        opcion = (OPCION_TRAMO if de_tramo else OPCION_PUNTUAL)[multa]
+        lineas = [f"Tramo del cuadro para límite {lim:g}: {rango} → {multa} € · {pts} puntos · {tramo['calificacion']}"]
+        if lim < 100 and via != "urbana":
+            avisos.append("Si se detectó en un tramo de autopista o autovía interurbana de acceso a una ciudad (límite inferior a 100 km/h), indícalo: "
+                          "la multa es la misma, pero los puntos y demás efectos solo cuentan por encima de 100 km/h (Anexo IV).")
     arts = articulos_velocidad(via, p.get("limite_origen"))
     fichas_art = [(art, _ficha_velocidad(datos, opcion, art)) for art in arts]
     fichas_art = [(art, f) for art, f in fichas_art if f]
     lineas.append(f"\nFICHA APLICABLE (opción {opcion}, {'velocidad media en tramo' if de_tramo else 'medición puntual'}):")
+    info = {"multa": multa, "reducida": multa / 2, "puntos": pts, "opcion": opcion, "nota_puntos": nota_puntos,
+            "calificacion": tramo["calificacion"], "precepto": None, "infraccion": None, "responsable": None}
     if fichas_art:
-        txt = lineas_ficha_trafico(fichas_art[0][1])
-        txt = re.sub(r"(?m)^(\s+)- Puntos: .*$", lambda m: f"{m.group(1)}- Puntos: {pts} (según el cuadro de velocidades; la ficha puede traer «0, 2, 4, 6»)", txt)
-        txt = re.sub(r"(?m)^(\s+- Infracción: )(.*)$", lambda m: m.group(1) + _rellenar_hecho(m.group(2), vc, lim), txt)
+        f0 = fichas_art[0][1]
         if len(fichas_art) > 1:  # origen del límite desconocido: la multa y los puntos son los mismos, cambia el artículo
-            opciones = " ó ".join(f"{_precepto(f)} ({CRITERIO_ARTICULO[art]})" for art, f in fichas_art)
-            txt = re.sub(r"(?m)^(\s+)- Norma y artículo / Precepto: .*$",
-                         lambda m: f"{m.group(1)}- Norma y artículo / Precepto: {opciones}. Elige según el origen del límite (la multa y los puntos son iguales)", txt)
+            precepto = " ó ".join(f"{_precepto(f)} ({CRITERIO_ARTICULO[art]})" for art, f in fichas_art) \
+                       + ". Elige según el origen del límite (la multa y los puntos son iguales)"
         else:
-            txt = re.sub(r"(?m)^(\s+)- Norma y artículo / Precepto: .*$",
-                         lambda m: f"{m.group(1)}- Norma y artículo / Precepto: {_precepto(fichas_art[0][1])} · opción {opcion} ({CRITERIO_ARTICULO[fichas_art[0][0]]})", txt)
+            precepto = f"{_precepto(f0)} · opción {opcion} ({CRITERIO_ARTICULO[fichas_art[0][0]]})"
+        infraccion = _rellenar_hecho(_hecho_limpio(f0), vc, lim)
+        cal = f0["calificacion"] + (f" (art. {re.sub(r'^0+', '', f0['art_sancionador'])} LSV)" if f0["art_sancionador"] else "")
+        info.update({"precepto": precepto, "infraccion": infraccion, "responsable": f0["responsable"], "calificacion": cal})
+        txt = lineas_ficha_trafico(f0)
+        txt = re.sub(r"(?m)^(\s+)- Puntos: .*$", lambda m: f"{m.group(1)}- Puntos: {pts} (según el cuadro de velocidades; la ficha puede traer «0, 2, 4, 6»)", txt)
+        txt = re.sub(r"(?m)^(\s+- Infracción: )(.*)$", lambda m: m.group(1) + infraccion, txt)
+        txt = re.sub(r"(?m)^(\s+)- Norma y artículo / Precepto: .*$", lambda m: f"{m.group(1)}- Norma y artículo / Precepto: {precepto}", txt)
+        if opcion in ("5K", "5L"):  # importe variable: la ficha no trae cuantía, se toma la del cuadro (la reducida es la mitad)
+            txt = re.sub(r"(?m)^(\s+)- Cuantía: .*$",
+                         lambda m: f"{m.group(1)}- Cuantía: {multa} € (cuantía reducida: {multa / 2:g} €; la ficha {opcion} trae importe variable y se toma el del cuadro)", txt)
         lineas.append(txt)
+    return lineas, avisos, info
+
+
+def _resumen_velocidad(v, vc, info):
+    return (f"Velocidad medida {v:g} km/h · velocidad corregida {vc:g} km/h · cuantía {info['multa']} € "
+            f"(reducida {info['reducida']:g} €) · {info['puntos']} puntos")
+
+
+def _texto_admin(v, vc, lim, txt_margen, info, avisos):
+    """Respuesta lista para el usuario (sin pasar por el modelo)."""
+    if info is None:
+        return [f"**Velocidad medida {v:g} km/h · velocidad corregida {vc:g} km/h · sin infracción por velocidad**", "",
+                f"- Límite: {lim:g} km/h", f"- Margen del cinemómetro: {txt_margen}",
+                "- Tras restar el margen, la velocidad no supera el primer tramo del cuadro para ese límite."]
+    out = [f"**{_resumen_velocidad(v, vc, info)}**", "",
+           f"- Límite: {lim:g} km/h",
+           f"- Margen del cinemómetro: {txt_margen}"]
+    if info["precepto"]:
+        out += [f"- Norma y artículo / Precepto: {info['precepto']}",
+                f"- Infracción: {info['infraccion']}",
+                f"- Calificación: {info['calificacion']}"]
+    out += [f"- Cuantía: {info['multa']} €",
+            f"- Cuantía reducida: {info['reducida']:g} €",
+            f"- Puntos: {info['puntos']}"]
+    if info["responsable"]:
+        out.append(f"- Responsable: {info['responsable']}")
+    if info["nota_puntos"]:
+        out.append(f"- Nota: {info['nota_puntos']}")
+    for a in avisos:
+        out.append(f"- Nota: {a}")
+    return out
+
+
+def resolver_velocidad(p: dict, datos: dict) -> dict:
+    etiqueta = "🧮 Cálculo: velocidad"
+    v, lim, via, vc = p.get("velocidad_medida_kmh"), p.get("limite_kmh"), p.get("via"), p.get("velocidad_corregida_kmh")
+    cin, nuevo, acceso = p.get("cinemometro"), bool(p.get("radar_nuevo")), bool(p.get("acceso_ciudad"))
+    if not v or not lim or v <= lim or not (datos.get("velocidad") or {}).get("graduacion"):
+        return _resultado("sin_calculo", None, "", "")
+    lim_eff = 100 if (acceso and lim < 100) else lim  # en accesos a ciudad los efectos penales cuentan desde 100 km/h
+    conocidos = f"velocidad medida {v:g} km/h, límite {lim:g} km/h (exceso medido {v - lim:g} km/h)"
+
+    # --- velocidad corregida: aportada, calculada con el margen del radar, o comprobada con todos los márgenes posibles ---
+    if vc:
+        vcs, vc_ref, txt_margen = [vc], vc, "velocidad corregida aportada por el agente"
+    elif cin in ("fijo", "movil", "tramo"):
+        c, txt = corregir_velocidad(datos, v, cin, nuevo)
+        if c is None:
+            return _faltan("velocidad", etiqueta, [
+                f"la velocidad corregida, es decir, la leída menos el margen del cinemómetro {cin} según su certificado "
+                "(la app no tiene confirmado el margen de ese tipo de radar)"], conocidos)
+        vcs, vc_ref, txt_margen = [c], c, txt
+    else:
+        pos = correcciones_posibles(datos, v)
+        if not pos:
+            return _resultado("sin_calculo", None, "", "")
+        c_ref, _ = corregir_velocidad(datos, v, "fijo", False)
+        vc_ref = c_ref if c_ref is not None else pos[0]
+        vcs = pos
+        txt_margen = (f"no se indicó el tipo de radar: según el margen, entre {pos[0]} y {pos[-1]} km/h; "
+                      f"se usa {vc_ref} km/h (radar fijo en servicio)")
+    varios = len(vcs) > 1
+
+    # --- umbral penal (art. 379.1 CP) ---
+    delito, umbral = False, None
+    if v - lim_eff > min(UMBRAL_PENAL.values()):
+        if via not in UMBRAL_PENAL:
+            return _faltan("velocidad", etiqueta, ["si es vía urbana, interurbana o travesía (el umbral penal es +60 km/h en urbana y +80 km/h en interurbana)"], conocidos)
+        umbral = UMBRAL_PENAL[via]
+        if min(vcs) - lim_eff > umbral:
+            delito = True
+        elif max(vcs) - lim_eff <= umbral:
+            delito = False
+        else:
+            return _faltan("velocidad", etiqueta, [
+                "el tipo de cinemómetro (fijo o móvil) o la velocidad corregida con su margen: el exceso está cerca del umbral penal y el margen decide si es delito"], conocidos)
+
+    de_tramo = cin == "tramo"
+    if not delito and varios and len({str(tramo_velocidad(datos, lim, x)) for x in vcs}) > 1:
+        return _faltan("velocidad", etiqueta, [
+            "el tipo de cinemómetro (fijo o móvil) o la velocidad corregida con su margen: según el margen cambia el tramo de la sanción"], conocidos)
+
+    lineas = ["RESULTADO DEL CÁLCULO (verificado por código; no recalcules ni cambies estas cifras)",
+              "Tipo de cálculo: velocidad" + (", umbral penal del art. 379.1 CP y graduación administrativa" if delito else ", graduación de la sanción (Anexo IV de la LSV)"),
+              f"Velocidad medida: {v:g} km/h · límite: {lim:g} km/h" + (" (a efectos penales se toma el límite de 100 km/h por tratarse de un acceso a ciudad)" if lim_eff != lim else ""),
+              f"Margen del cinemómetro: {txt_margen}",
+              f"Velocidad corregida: {vc_ref:g} km/h"]
     avisos = []
-    acc = (OPCION_ACCESO_TRAMO if de_tramo else OPCION_ACCESO_PUNTUAL).get(multa, "5L" if de_tramo else "5K")
-    avisos.append(f"Si se detectó en un tramo de autopista o autovía de acceso a una ciudad, las opciones son otras: "
-                  f"{acc} ({'600 €, muy grave' if multa == 600 else 'importe variable entre 100 y 500 €, puntos 0/2/4/6'}).")
-    lineas.append("\nAVISOS: " + " ".join(avisos))
-    return _resultado("completo", "velocidad", etiqueta, "\n".join(lineas))
+    if varios and not delito:
+        avisos.append("No se indicó el tipo de radar: con cualquier margen (fijo o móvil, nuevo o en servicio) el tramo de la sanción es el mismo. "
+                      "Si quieres el dato exacto, indica el tipo de radar.")
+    admin = _bloque_admin(datos, p, vc_ref, lim, via, acceso, de_tramo)
+    if admin is None:
+        return _resultado("sin_calculo", None, "", "")  # límite que no figura en el cuadro: flujo normal
+    alt, avisos_alt, info = admin
+    avisos += avisos_alt
+
+    if delito:
+        nombre_via = {"urbana": "urbana", "interurbana": "interurbana", "travesia": "travesía (se aplica el umbral de vía interurbana)"}[via]
+        exceso_txt = (f"{vc_ref - lim_eff:g} km/h" if not varios else f"entre {min(vcs) - lim_eff:g} y {max(vcs) - lim_eff:g} km/h con cualquier margen")
+        lineas.append(f"Vía {nombre_via} · umbral penal: más de {umbral} km/h sobre el límite. Exceso corregido: {exceso_txt}")
+        lineas.append(f"RESULTADO PENAL: PRESUNTO DELITO del art. 379.1 CP (el exceso corregido supera {umbral} km/h"
+                      + (" con cualquier margen de cinemómetro)." if varios else ")."))
+        lineas.append("Consecuencia: procede el atestado por presunto delito contra la seguridad vial. Se rellena igualmente la denuncia administrativa "
+                      "por si se desestima la vía penal; la vía penal prevalece.")
+        lineas.append("\nALTERNATIVA ADMINISTRATIVA (por si se desestima la vía penal):")
+        lineas += alt
+        if varios and len({str(tramo_velocidad(datos, lim, x)) for x in vcs}) > 1:
+            avisos.append("Según el margen del radar, el tramo administrativo podría ser otro: indica el tipo de radar para fijarlo.")
+        if avisos:
+            lineas.append("AVISOS: " + " ".join(avisos))
+        if varios:
+            frase = (f"La velocidad corregida, con cualquier margen de radar, está entre {min(vcs):g} y {max(vcs):g} km/h: supera el límite entre "
+                     f"{min(vcs) - lim_eff:g} y {max(vcs) - lim_eff:g} km/h")
+        else:
+            frase = f"La velocidad corregida ({vc_ref:g} km/h) supera el límite en {vc_ref - lim_eff:g} km/h"
+        cab = [f"**Vía penal: presunto delito del art. 379.1 CP.** {frase}, y el umbral penal es más de {umbral} km/h. "
+               "Procede el atestado por presunto delito contra la seguridad vial.", "",
+               "**Alternativa administrativa** (se rellena por si se desestima la vía penal; la penal prevalece):", ""]
+        respuesta = "\n".join(cab + _texto_admin(v, vc_ref, lim, txt_margen, info, avisos))
+        return _resultado("completo", "velocidad", etiqueta, "\n".join(lineas), respuesta)
+
+    lineas += alt
+    if avisos:
+        lineas.append("AVISOS: " + " ".join(avisos))
+    respuesta = "\n".join(_texto_admin(v, vc_ref, lim, txt_margen, info, avisos))
+    return _resultado("completo", "velocidad", etiqueta, "\n".join(lineas), respuesta)
 
 
 # ==================================================================
