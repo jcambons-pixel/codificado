@@ -10,6 +10,8 @@ from pinecone import Pinecone
 from pathlib import Path
 from PIL import Image
 from datetime import datetime, timedelta
+VERSION_APP = "2026-10-alcohol-4"  # debe coincidir con VERSION de calculos.py
+
 try:
     from buscador import construir_indices, buscar_lexico, fusionar
     BUSCADOR_OK = True
@@ -17,6 +19,7 @@ except ImportError:  # sin buscador.py la app sigue con la búsqueda semántica 
     BUSCADOR_OK = False
 try:
     from calculos import cargar_datos, calcular, opciones_dimension_para_prompt, extraer_velocidad_conversacion, extraer_alcohol_conversacion
+    from calculos import VERSION as VERSION_CALCULOS
     CALCULOS_OK = True
 except ImportError:  # falta calculos.py junto a app.py: la app sigue funcionando sin calculadoras
     CALCULOS_OK = False
@@ -35,6 +38,8 @@ except ImportError:  # falta calculos.py junto a app.py: la app sigue funcionand
 
     def extraer_alcohol_conversacion(*args, **kwargs):
         return None
+
+    VERSION_CALCULOS = None
 
 # ------------------------------------------------------------------
 # Logo del proyecto
@@ -833,16 +838,20 @@ with st.sidebar:
         st.session_state.calculo_reciente = False
         st.session_state.selector_modo = OPCION_AUTO  # se asigna antes de crear el radio, por eso es válido
         st.rerun()
+    st.caption(f"Versión: app {VERSION_APP} · calculos {VERSION_CALCULOS or 'no cargado'}")
+    if VERSION_CALCULOS and VERSION_CALCULOS != VERSION_APP:
+        st.warning("app.py y calculos.py son de versiones distintas: súbelos juntos.")
     st.caption(f"Filtros por metadatos: {'ON' if USAR_FILTROS_METADATOS else 'OFF'}")
     st.caption(f"Debug: {'ON' if MODO_DEBUG else 'OFF'}")
     st.caption(f"Límite de peticiones a Gemini: {MAX_RPM}/min (embeddings: {MAX_RPM_EMBEDDING}/min)")
     if not CALCULOS_OK:
-        st.caption("Calculadoras: OFF (falta calculos.py junto a app.py)")
+        st.caption("Calculadoras: OFF (calculos.py no está o es de una versión antigua: súbelo junto a app.py)")
     elif not DATOS_CALCULO:
         st.caption("Calculadoras: OFF (falta la carpeta datos/ con los 2 JSON)")
     else:
         st.caption("Calculadoras: ON")
         st.caption("Cuadro de velocidad: ON" if DATOS_CALCULO.get("velocidad") else "Cuadro de velocidad: OFF (falta datos/velocidad.json)")
+        st.caption("Datos de alcohol: ON" if DATOS_CALCULO.get("alcohol") else "Datos de alcohol: OFF (falta datos/alcohol.json)")
     if MODO_DEBUG:
         st.caption(f"Códigos de transporte cargados: {len(CODIGOS_TRANSPORTE)}")
 
