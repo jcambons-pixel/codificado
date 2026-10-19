@@ -1029,7 +1029,7 @@ def resolver_alcohol(p: dict, datos: dict) -> dict:
     elif m > cfg["hasta_mgl"]:
         corr_ref = _corregir_alcohol(cfg, m)
         corrs = [corr_ref]
-        txt_margen = f"etilómetro en servicio, {cfg['porcentaje']:g} % por encima de {_mgl(cfg['hasta_mgl'])} mg/l (Orden ITC/3707/2006)"
+        txt_margen = f"etilómetro en servicio, {str(cfg['porcentaje']).replace('.', ',')} % por encima de {_mgl(cfg['hasta_mgl'])} mg/l (Orden ITC/3707/2006)"
     else:
         corr_ref = _corregir_alcohol(cfg, m)
         corrs = sorted({_corregir_alcohol(cfg, m), _corregir_alcohol(cfg, m, alc["margenes"]["plausible_minimo_fijo_mgl"])})
@@ -1041,17 +1041,19 @@ def resolver_alcohol(p: dict, datos: dict) -> dict:
     conductores = [cond] if cond in alc["limites_mgl"] else list(alc["limites_mgl"])
     reinc = p.get("reincidente")
 
-    # ¿el resultado es el mismo con todos los márgenes y tipos de conductor posibles?
+    # ¿el resultado es el mismo con todos los márgenes y tipos de conductor posibles? Si no, se pregunta lo que lo decide
     niveles = {(c, x): _nivel_alcohol(x, alc["limites_mgl"][c]) for c in conductores for x in corrs}
-    if len({niveles[(c, x)] for c in conductores for x in corrs}) > 1:
-        if len({niveles[(cond_, x)] for cond_ in conductores for x in corrs if True}) > 1 and len(corrs) > 1 and len(conductores) == 1:
-            return _faltan("alcohol", etiqueta, ["la tasa corregida, es decir, la medida menos el margen del etilómetro según su certificado: "
-                                                 "el margen cambia el tramo de la sanción"], conocidos)
-        if len(conductores) > 1 and all(len({niveles[(c, x)] for x in corrs}) == 1 for c in conductores):
-            return _faltan("alcohol", etiqueta, ["si el conductor es en general o profesional, novel, de urgencia o de mercancías peligrosas "
-                                                 "(los límites son 0,25 y 0,15 mg/l y cambia el tramo)"], conocidos)
-        return _faltan("alcohol", etiqueta, ["la tasa corregida (la medida menos el margen del etilómetro) y si el conductor es en general o profesional/novel: "
-                                             "con los datos actuales cambia el tramo de la sanción"], conocidos)
+    cambia_margen = any(len({niveles[(c, x)] for x in corrs}) > 1 for c in conductores)
+    cambia_conductor = len(conductores) > 1 and any(len({niveles[(c, x)] for c in conductores}) > 1 for x in corrs)
+    if cambia_margen or cambia_conductor:
+        pide = []
+        if cambia_margen:
+            pide.append("la tasa corregida, es decir, la medida menos el margen del etilómetro según su certificado "
+                        "(el margen cambia el tramo de la sanción)")
+        if cambia_conductor:
+            pide.append("si el conductor es en general o profesional, novel, de urgencia o de mercancías peligrosas "
+                        "(los límites son 0,25 y 0,15 mg/l y cambia el tramo)")
+        return _faltan("alcohol", etiqueta, pide, conocidos)
     c_ref = conductores[0] if len(conductores) == 1 else "general"
     limite = alc["limites_mgl"][c_ref]
     nivel = niveles[(c_ref, corrs[0])]
@@ -1104,8 +1106,9 @@ def resolver_alcohol(p: dict, datos: dict) -> dict:
             ops = alc["opciones"][c_ref]
             fr = _ficha_alcohol(datos, ops["bajo_reincidente"])
             if fr:
+                pts_r = int(re.sub(r"\D", "", fr["puntos"]) or 0)
                 l.append(f"- Nota: si consta sanción firme por el art. 20 en el año anterior a los hechos, la cuantía es de {fr['multa']:g} € "
-                         f"con {re.sub(chr(92) + 'D', '', fr['puntos']) or fr['puntos']} puntos (opción {ops['bajo_reincidente']}).")
+                         f"con {pts_r} puntos (opción {ops['bajo_reincidente']}).")
         if nivel == "bajo" and reinc is True:
             l.append("- Nota: se aplica la cuantía de reincidencia (sanción firme por el art. 20 en el año anterior a los hechos).")
         l.append("- Nota: posible inmovilización del vehículo (art. 104.1.d LSV: pruebas con resultado positivo); la retirada y el depósito solo en los casos del art. 105.")
@@ -1154,7 +1157,7 @@ def _lee_parcial_alcohol(texto: str) -> dict:
             sangre = True
             continue
         v = float(m.group(1).replace(",", "."))
-        if 0 < v <= 5 and (unidad.startswith(("mg", "miligramo")) or re.search(r"alcohol|etil|soplar|tasa|alcoholemia", t, re.I)):
+        if 0 < v <= 5 and (unidad.startswith(("mg", "miligramo")) or re.search(r"mg/?l|miligramos|alcohol|etil|soplar|tasa|alcoholemia", t, re.I)):
             resto = t[m.end():m.end() + 12]
             if re.match(r"\s*(?:km|m\b|metros|kg|%|euros|€|h\b|horas)", resto, re.I):
                 continue
