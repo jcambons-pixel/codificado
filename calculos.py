@@ -12,6 +12,8 @@ import json
 import re
 from pathlib import Path
 
+VERSION = "2026-10-alcohol-4"  # debe coincidir con VERSION_APP de app.py: la barra lateral avisa si no coinciden
+
 # ------------------------------------------------------------------
 # Carga de datos (generados por preparar_datos.py)
 # ------------------------------------------------------------------
@@ -1138,6 +1140,7 @@ def resolver_alcohol(p: dict, datos: dict) -> dict:
 # Lector de alcoholemia directamente del texto (sin IA)
 # ------------------------------------------------------------------
 _RE_ALC_CONTEXTO = re.compile(r"alcohol|etil[oó]metro|alcoholemia|soplar|sopl[oó]|aire espirado|mg/?l|tasa", re.I)
+_RE_OTRO_DOMINIO = re.compile(r"km/?h|kil[oó]metros|\bkg\b|kilos|\bmma\b|tonelad|\bmetros?\b|\bm\b|\bcm\b|horas|minutos|\u20ac|euros|%|sobresal|altura|longitud|anchura|peso|\bt\b", re.I)
 _RE_ALC_NUM = re.compile(r"(?<![\d.,])(\d[.,]\d{1,3}|[.,]\d{1,3})(?![\d])\s*(mg/?l|mg|miligramos?|g/?l|gr/?l|gramos?|g\b)?", re.I)
 
 
@@ -1148,7 +1151,10 @@ def _lee_parcial_alcohol(texto: str) -> dict:
     corr_span = mc.span(1) if mc else None
     if mc:
         out["tasa_corregida_mgl"] = float(mc.group(1).replace(",", "."))
-    sangre = False
+    # Un decimal sin unidad se entiende SIEMPRE como mg/l en aire espirado (la sangre en g/l apenas se usa), salvo que el
+    # mensaje traiga marcas de otros cálculos (km/h, metros, kg, horas, euros...) o sea un texto largo sin relación con el alcohol.
+    desnudo_ok = (not _RE_OTRO_DOMINIO.search(t)) and (bool(_RE_ALC_CONTEXTO.search(t)) or len(t.split()) <= 14)
+    sangre = bool(re.search(r"\bsangre\b|anal[ií]tica", t, re.I))
     for m in _RE_ALC_NUM.finditer(t):
         if corr_span and m.span(1) == corr_span:
             continue
@@ -1157,16 +1163,18 @@ def _lee_parcial_alcohol(texto: str) -> dict:
             sangre = True
             continue
         v = float(m.group(1).replace(",", "."))
-        if 0 < v <= 5 and (unidad.startswith(("mg", "miligramo")) or re.search(r"mg/?l|miligramos|alcohol|etil|soplar|tasa|alcoholemia", t, re.I)):
+        if 0 < v <= 5 and (unidad.startswith(("mg", "miligramo")) or desnudo_ok or re.search(r"mg/?l|miligramos|alcohol|etil|soplar|tasa|alcoholemia", t, re.I)):
             resto = t[m.end():m.end() + 12]
             if re.match(r"\s*(?:km|m\b|metros|kg|%|euros|€|h\b|horas)", resto, re.I):
                 continue
             out["mediciones_mgl"].append(v)
-    out["sangre"] = sangre
+    out["sangre"] = sangre or out.get("sangre", False)
     low = t.lower()
-    if re.search(r"profesional|novel|autob[uú]s|autocar|escolar|mercanc[ií]as peligrosas|urgencia|ambulancia|transporte especial", low):
+    if re.search(r"no (?:es )?(?:un )?(?:conductor )?(?:profesional|novel)|ni (?:profesional|novel)|no profesional", low):
+        out["conductor"] = "general"
+    elif re.search(r"profesional|novel|autob[uú]s|autocar|escolar|mercanc[ií]as peligrosas|urgencia|ambulancia|transporte especial", low):
         out["conductor"] = "profesional_novel"
-    elif re.search(r"conductor general|\bgeneral\b|particular", low):
+    elif re.search(r"conductor general|\bgeneral\b|particular|\bnormal\b|ordinario|com[uú]n\b|corriente", low):
         out["conductor"] = "general"
     if re.search(r"reincident|sanci[oó]n firme|sancionad[oa]\s+(?:por\s+alcohol\s+)?(?:en|durante)\s+el\s+[uú]ltimo\s+a[ñn]o", low):
         out["reincidente"] = True
@@ -1183,7 +1191,7 @@ def extraer_alcohol_conversacion(pregunta: str, previos_usuario: list, calculo_r
     t = pregunta or ""
     if re.search(r"km/?h|kilogramos|\bkg\b|\bMMA\b|tonelad", t, re.I):
         return None
-    actual = _lee_parcial_alcohol(t) if _RE_ALC_CONTEXTO.search(t) else None
+    actual = _lee_parcial_alcohol(t)
     if actual and actual["mediciones_mgl"] and not actual["sangre"]:
         base = actual
     elif calculo_reciente and previos_usuario:
