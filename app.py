@@ -16,7 +16,7 @@ try:
 except ImportError:  # sin buscador.py la app sigue con la búsqueda semántica sola
     BUSCADOR_OK = False
 try:
-    from calculos import cargar_datos, calcular, opciones_dimension_para_prompt, extraer_velocidad_conversacion
+    from calculos import cargar_datos, calcular, opciones_dimension_para_prompt, extraer_velocidad_conversacion, extraer_alcohol_conversacion
     CALCULOS_OK = True
 except ImportError:  # falta calculos.py junto a app.py: la app sigue funcionando sin calculadoras
     CALCULOS_OK = False
@@ -31,6 +31,9 @@ except ImportError:  # falta calculos.py junto a app.py: la app sigue funcionand
         return ""
 
     def extraer_velocidad_conversacion(*args, **kwargs):
+        return None
+
+    def extraer_alcohol_conversacion(*args, **kwargs):
         return None
 
 # ------------------------------------------------------------------
@@ -315,11 +318,12 @@ EXTRACCION_REGLAS = """
 ADEMÁS, extrae los datos para las calculadoras (tiempos de conducción, masas, dimensiones, cargas que sobresalen),
 combinando los datos de TODA la conversación. Estructura:
 {
- "calculo": "tiempos" | "masas" | "dimensiones" | "cargas" | "velocidad" | null,
+ "calculo": "tiempos" | "masas" | "dimensiones" | "cargas" | "velocidad" | "alcohol" | null,
  "tiempos": {"eventos": [{"tipo": "conduccion|pausa|descanso", "minutos": entero}], "transporte": "mercancias|viajeros|null", "ampliacion_10h": true|false|null},
  "masas": {"peso_medido_kg": número|null, "mma_kg": número|null, "margen_bascula": {"valor": número, "unidad": "kg|%"}|null, "peso_ya_neto": true|null, "categoria": "N1|N2|N3|null", "mma_vehiculo_kg": número|null, "regimen": "publico|privado|null", "base": "mma|eje|null"},
  "dimensiones": {"magnitud": "longitud|anchura|altura|null", "medida_m": número|null, "tipo_vehiculo": clave|null, "modificadores": [claves], "causa_exceso": "carga_indivisible|caracteristica_tecnica|otra|null", "autorizacion": "sin_autorizacion|incumple_condiciones|con_autorizacion_cumple|null"},
  "velocidad": {"velocidad_medida_kmh": número|null, "limite_kmh": número|null, "via": "urbana|interurbana|travesia|null", "velocidad_corregida_kmh": número|null, "cinemometro": "fijo|movil|tramo|null", "radar_nuevo": true|null, "limite_origen": "senalizado|generico|null", "acceso_ciudad": true|null},
+ "alcohol": {"mediciones_mgl": [números], "conductor": "general|profesional_novel|null", "reincidente": true|false|null, "sintomas": true|null, "tasa_corregida_mgl": número|null},
  "cargas": {"vehiculo_exclusivo_mercancias": true|false|null, "longitud_vehiculo_m": número|null, "ancho_vehiculo_m": número|null, "ancho_total_m": número|null, "direccion": "detras|delante|lateral|null", "sobresale_m": número|null, "indivisible": true|false|null, "tipo_carga": "longitud_indivisible|otra|null", "senal_v20": true|false|null, "luz": true|false|null, "visibilidad_reducida": true|false|null, "transporte_especial": true|false|null}
 }
 Reglas de extracción:
@@ -341,6 +345,9 @@ Reglas de extracción:
   "limite_origen": "senalizado" si dicen que el límite lo fija una señal (vertical, marcas viales, panel) o es una limitación específica de un vehículo o de un conductor;
   "generico" si dicen que es el límite genérico de la vía (sin señal específica); null si no lo dicen.
   "acceso_ciudad": true solo si dicen que es un tramo de autopista o autovía interurbana de acceso a una ciudad o una circunvalación con límite inferior a 100 km/h; en otro caso null.
+- ALCOHOL: solo aire espirado en mg/l (si dan g/l de sangre, "calculo": null). "mediciones_mgl": todas las pruebas con etilómetro (una o dos). "conductor": profesional_novel si es profesional,
+  novel, de urgencia, mercancías peligrosas, transporte escolar o especial; general si se dice que es general o particular; null si no se dice. "reincidente": true si hay sanción firme
+  por alcohol en el último año. "sintomas": true si hay síntomas, signos de embriaguez, conducción anómala o accidente. "tasa_corregida_mgl" solo si dicen que ya se ha restado el margen.
 - CARGAS vs DIMENSIONES: una carga que SOBRESALE del vehículo (tabla de surf, barra, viga, bultos fuera de su proyección) es "cargas", NUNCA "dimensiones".
   "dimensiones" es solo para el largo, ancho o alto TOTAL del vehículo o conjunto (con su carga). Si no sabes si una medida es la longitud del vehículo o lo que sobresale, no la pongas en "dimensiones".
 - CARGAS (art. 15 RGC): "vehiculo_exclusivo_mercancias": true para camión o vehículo de carga; false para turismo y vehículos mixtos o de uso particular; null si no queda claro.
@@ -742,7 +749,7 @@ def obtener_indices_lexicos():
 INDICES_LEXICOS = obtener_indices_lexicos()
 
 RE_CALCULO = re.compile(
-    r"conduc|descans|paus|horas|minutos|tac[óo]graf|peso|pesa|kg|kilo|tonelad|\bt\b|mma|\beje|altur|\balto|anch|larg|longitud|metros|\bm\b|sobresal|baca|km/?h|velocid|radar|cinem|l[ií]mit|limitad|tramo|urban|v[ií]a|autov|autopista|carretera|travesía|circunvalaci",
+    r"conduc|descans|paus|horas|minutos|tac[óo]graf|peso|pesa|kg|kilo|tonelad|\bt\b|mma|\beje|altur|\balto|anch|larg|longitud|metros|\bm\b|sobresal|baca|km/?h|velocid|radar|cinem|l[ií]mit|limitad|tramo|urban|v[ií]a|autov|autopista|carretera|travesía|circunvalaci|alcohol|etil[oó]metro|soplar|tasa|mg/?l|alcoholemia",
     re.I,
 )
 
@@ -878,7 +885,7 @@ if pregunta_usuario:
             resultado_calculo = {"estado": "sin_calculo", "texto": "", "etiqueta": "", "respuesta": None}
             extraccion, origen_calculo = None, ""
 
-            # 0a. VELOCIDAD: se lee directamente del texto (sin IA). Es el caso más frecuente y no debe depender de
+            # 0a. VELOCIDAD y ALCOHOL: se leen directamente del texto (sin IA). Es el caso más frecuente y no debe depender de
             #     que el modelo extraiga bien la frase; además no gasta ninguna llamada a Gemini.
             if DATOS_CALCULO and modo_forzado != "CONSULTA_GENERAL":
                 vel_local = extraer_velocidad_conversacion(
@@ -890,6 +897,16 @@ if pregunta_usuario:
                     extraccion = {"calculo": "velocidad", "velocidad": vel_local}
                     resultado_calculo = calcular(extraccion, DATOS_CALCULO)
                     origen_calculo = "leída del texto, sin IA"
+                if resultado_calculo["estado"] == "sin_calculo":
+                    alc_local = extraer_alcohol_conversacion(
+                        pregunta_usuario,
+                        [m["content"] for m in historial_previo if m["role"] == "user"],
+                        st.session_state.get("calculo_reciente", False),
+                    )
+                    if alc_local:
+                        extraccion = {"calculo": "alcohol", "alcohol": alc_local}
+                        resultado_calculo = calcular(extraccion, DATOS_CALCULO)
+                        origen_calculo = "leídos del texto, sin IA"
 
             # 0b. Si no era velocidad: UN solo análisis por mensaje (modo + hechos infractores + datos de las calculadoras).
             #     Se omite cuando no hace falta (modo forzado sin cálculo posible, código de transporte, o cálculo ya resuelto).
