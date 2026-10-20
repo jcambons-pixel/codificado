@@ -1,0 +1,46 @@
+{
+ "fuente": "Fichas del art. 20 RGC (codificado de tráfico); márgenes de la Orden ICT/155/2020 según el usuario; norma penal del RAG.",
+ "limites_mgl": {
+  "general": 0.25,
+  "profesional_novel": 0.15
+ },
+ "penal": {
+  "umbral_objetivo_corregida_mgl": 0.6,
+  "banda_sintomas_corregida_mgl": [
+   0.4,
+   0.6
+  ],
+  "nota": "Delito objetivo: tasa corregida (margen descontado y truncada a 2 decimales) SUPERIOR a 0,60 mg/l; con 7,5 % equivale a una medición de al menos 0,66 mg/l (la norma del RAG). Entre 0,40 y 0,60 mg/l solo si hay sintomatología o conducción anómala (influencia)."
+ },
+ "opciones": {
+  "general": {
+   "bajo": "5E",
+   "bajo_reincidente": "5M",
+   "alto": "5I"
+  },
+  "profesional_novel": {
+   "bajo": "5G",
+   "bajo_reincidente": "5Ñ",
+   "alto": "5K"
+  }
+ },
+ "margenes": {
+  "activo": true,
+  "nota": "Orden ICT/155/2020 (la ficha 5E aún cita la derogada ITC/3707/2006). Valores aportados por el usuario. El margen se descuenta siempre a favor del conductor y la tasa corregida se TRUNCA a 2 decimales.",
+  "redondeo": "abajo, truncado a 2 decimales",
+  "en_servicio": {
+   "hasta_mgl": 0.4,
+   "fijo_mgl": 0.03,
+   "porcentaje": 7.5,
+   "confirmado": true,
+   "fuente": "etilómetro en servicio (el habitual)"
+  },
+  "nuevo": {
+   "hasta_mgl": 0.4,
+   "fijo_mgl": 0.02,
+   "porcentaje": 5.0,
+   "confirmado": true,
+   "fuente": "etilómetro nuevo (primer año) o recién reparado y verificado"
+  }
+ }
+}
