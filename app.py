@@ -10,7 +10,7 @@ from pinecone import Pinecone
 from pathlib import Path
 from PIL import Image
 from datetime import datetime, timedelta
-VERSION_APP = "2026-10-alcohol-4"  # debe coincidir con VERSION de calculos.py
+VERSION_APP = "2026-10-alcohol-5"  # debe coincidir con VERSION de calculos.py
 
 try:
     from buscador import construir_indices, buscar_lexico, fusionar
@@ -328,7 +328,7 @@ combinando los datos de TODA la conversación. Estructura:
  "masas": {"peso_medido_kg": número|null, "mma_kg": número|null, "margen_bascula": {"valor": número, "unidad": "kg|%"}|null, "peso_ya_neto": true|null, "categoria": "N1|N2|N3|null", "mma_vehiculo_kg": número|null, "regimen": "publico|privado|null", "base": "mma|eje|null"},
  "dimensiones": {"magnitud": "longitud|anchura|altura|null", "medida_m": número|null, "tipo_vehiculo": clave|null, "modificadores": [claves], "causa_exceso": "carga_indivisible|caracteristica_tecnica|otra|null", "autorizacion": "sin_autorizacion|incumple_condiciones|con_autorizacion_cumple|null"},
  "velocidad": {"velocidad_medida_kmh": número|null, "limite_kmh": número|null, "via": "urbana|interurbana|travesia|null", "velocidad_corregida_kmh": número|null, "cinemometro": "fijo|movil|tramo|null", "radar_nuevo": true|null, "limite_origen": "senalizado|generico|null", "acceso_ciudad": true|null},
- "alcohol": {"mediciones_mgl": [números], "conductor": "general|profesional_novel|null", "reincidente": true|false|null, "sintomas": true|null, "tasa_corregida_mgl": número|null},
+ "alcohol": {"mediciones_mgl": [números], "conductor": "general|profesional_novel|null", "reincidente": true|false|null, "sintomas": true|null, "tasa_corregida_mgl": número|null, "etilometro_nuevo": true|null},
  "cargas": {"vehiculo_exclusivo_mercancias": true|false|null, "longitud_vehiculo_m": número|null, "ancho_vehiculo_m": número|null, "ancho_total_m": número|null, "direccion": "detras|delante|lateral|null", "sobresale_m": número|null, "indivisible": true|false|null, "tipo_carga": "longitud_indivisible|otra|null", "senal_v20": true|false|null, "luz": true|false|null, "visibilidad_reducida": true|false|null, "transporte_especial": true|false|null}
 }
 Reglas de extracción:
@@ -352,7 +352,7 @@ Reglas de extracción:
   "acceso_ciudad": true solo si dicen que es un tramo de autopista o autovía interurbana de acceso a una ciudad o una circunvalación con límite inferior a 100 km/h; en otro caso null.
 - ALCOHOL: solo aire espirado en mg/l (si dan g/l de sangre, "calculo": null). "mediciones_mgl": todas las pruebas con etilómetro (una o dos). "conductor": profesional_novel si es profesional,
   novel, de urgencia, mercancías peligrosas, transporte escolar o especial; general si se dice que es general o particular; null si no se dice. "reincidente": true si hay sanción firme
-  por alcohol en el último año. "sintomas": true si hay síntomas, signos de embriaguez, conducción anómala o accidente. "tasa_corregida_mgl" solo si dicen que ya se ha restado el margen.
+  por alcohol en el último año. "sintomas": true si hay síntomas, signos de embriaguez, conducción anómala o accidente. "tasa_corregida_mgl" solo si dicen que ya se ha restado el margen. "etilometro_nuevo": true solo si dicen que el etilómetro es nuevo (primer año) o recién reparado y verificado.
 - CARGAS vs DIMENSIONES: una carga que SOBRESALE del vehículo (tabla de surf, barra, viga, bultos fuera de su proyección) es "cargas", NUNCA "dimensiones".
   "dimensiones" es solo para el largo, ancho o alto TOTAL del vehículo o conjunto (con su carga). Si no sabes si una medida es la longitud del vehículo o lo que sobresale, no la pongas en "dimensiones".
 - CARGAS (art. 15 RGC): "vehiculo_exclusivo_mercancias": true para camión o vehículo de carga; false para turismo y vehículos mixtos o de uso particular; null si no queda claro.

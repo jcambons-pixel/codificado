@@ -12,7 +12,7 @@ import json
 import re
 from pathlib import Path
 
-VERSION = "2026-10-alcohol-4"  # debe coincidir con VERSION_APP de app.py: la barra lateral avisa si no coinciden
+VERSION = "2026-10-alcohol-5"  # debe coincidir con VERSION_APP de app.py: la barra lateral avisa si no coinciden
 
 # ------------------------------------------------------------------
 # Carga de datos (generados por preparar_datos.py)
@@ -974,18 +974,25 @@ import math
 
 
 def _mgl(x: float) -> str:
-    return f"{x:.3f}".rstrip("0").rstrip(".").replace(".", ",")
+    """mg/l con al menos 2 decimales (0,60; 0,388): así se escribe en el boletín."""
+    t = f"{x:.3f}"
+    t = t[:-1] if t.endswith("0") else t
+    return t.replace(".", ",")
 
 
-def _suelo3(x: float) -> float:
-    return math.floor(round(x * 1000, 6)) / 1000
+def _mgl3(x: float) -> str:
+    return f"{x:.3f}".replace(".", ",")
 
 
-def _corregir_alcohol(cfg, m, fijo=None):
-    fijo = cfg["fijo_mgl"] if fijo is None else fijo
+def _trunc2(x: float) -> float:
+    """Trunca (hacia abajo) a 2 decimales, a favor del conductor."""
+    return math.floor(round(x * 100, 6)) / 100
+
+
+def _corregir_alcohol(cfg, m):
     if m <= cfg["hasta_mgl"]:
-        return _suelo3(m - fijo)
-    return _suelo3(m * (1 - cfg["porcentaje"] / 100))
+        return _trunc2(m - cfg["fijo_mgl"])
+    return _trunc2(m * (1 - cfg["porcentaje"] / 100))
 
 
 def _nivel_alcohol(corr, limite):
@@ -1021,22 +1028,24 @@ def resolver_alcohol(p: dict, datos: dict) -> dict:
     if not meds:
         return _sin_calculo("no hay ninguna tasa en mg/l")
     m = min(meds)
-    cfg = alc["margenes"]["en_servicio"]
+    nuevo = bool(p.get("etilometro_nuevo"))
+    cfg = alc["margenes"]["nuevo" if nuevo else "en_servicio"]
     conocidos = "tasa(s) medida(s) " + " y ".join(_mgl(x) for x in meds) + " mg/l"
 
-    # --- tasa corregida: aportada, calculada con el margen, o comprobada con el rango plausible ---
+    # --- tasa corregida: aportada por el agente o calculada con el margen (descontado a favor del conductor y truncado a 2 decimales) ---
     tc = p.get("tasa_corregida_mgl")
     if tc:
-        corrs, corr_ref, txt_margen = [float(tc)], float(tc), "tasa corregida aportada por el agente"
-    elif m > cfg["hasta_mgl"]:
-        corr_ref = _corregir_alcohol(cfg, m)
-        corrs = [corr_ref]
-        txt_margen = f"etilómetro en servicio, {str(cfg['porcentaje']).replace('.', ',')} % por encima de {_mgl(cfg['hasta_mgl'])} mg/l (Orden ITC/3707/2006)"
+        corr_ref, txt_margen = float(tc), "tasa corregida aportada por el agente"
     else:
         corr_ref = _corregir_alcohol(cfg, m)
-        corrs = sorted({_corregir_alcohol(cfg, m), _corregir_alcohol(cfg, m, alc["margenes"]["plausible_minimo_fijo_mgl"])})
-        txt_margen = (f"etilómetro en servicio, {_mgl(cfg['fijo_mgl'])} mg/l hasta {_mgl(cfg['hasta_mgl'])} mg/l (Orden ITC/3707/2006)"
-                      + ("" if cfg["confirmado_fijo"] else " [margen sin confirmar en la app]"))
+        etapa = "nuevo o recién reparado" if nuevo else "en servicio"
+        if m > cfg["hasta_mgl"]:
+            txt_margen = (f"etilómetro {etapa}: {str(cfg['porcentaje']).replace('.', ',')} % de la tasa medida por encima de {_mgl3(cfg['hasta_mgl'])} mg/l "
+                          f"(Orden ICT/155/2020); resultado truncado a 2 decimales")
+        else:
+            txt_margen = (f"etilómetro {etapa}: ±{_mgl3(cfg['fijo_mgl'])} mg/l hasta {_mgl3(cfg['hasta_mgl'])} mg/l "
+                          f"(Orden ICT/155/2020); resultado truncado a 2 decimales")
+    corrs = [corr_ref]
 
     # --- tipo de conductor ---
     cond = p.get("conductor")
@@ -1060,11 +1069,12 @@ def resolver_alcohol(p: dict, datos: dict) -> dict:
     limite = alc["limites_mgl"][c_ref]
     nivel = niveles[(c_ref, corrs[0])]
 
-    # --- vía penal (norma del RAG) ---
+    # --- vía penal (art. 379.2 CP): se evalúa sobre la tasa CORREGIDA (margen descontado y truncada a 2 decimales) ---
     pen = alc["penal"]
-    objetivo = m >= pen["objetivo_min_medida_mgl"]
-    ba, bb = pen["banda_sintomas_mgl"]
-    banda = ba <= m <= bb
+    umbral = pen["umbral_objetivo_corregida_mgl"]
+    ba, bb = pen["banda_sintomas_corregida_mgl"]
+    objetivo = corr_ref > umbral
+    banda = ba <= corr_ref <= bb
     sintomas = p.get("sintomas")
     delito = objetivo or (banda and sintomas is True)
 
@@ -1119,16 +1129,15 @@ def resolver_alcohol(p: dict, datos: dict) -> dict:
     bloque_modelo = ["RESULTADO DEL CÁLCULO (verificado por código)", "Tipo de cálculo: alcoholemia en aire espirado",
                      f"Tasa medida (la menor): {_mgl(m)} mg/l · margen: {txt_margen} · tasa corregida: {_mgl(corr_ref)} mg/l"]
     if delito:
-        motivo = (f"La menor de las mediciones ({_mgl(m)} mg/l) es de al menos {_mgl(pen['objetivo_min_medida_mgl'])} mg/l: tasa objetiva superior a 0,60 mg/l "
-                  "tras descontar el error del etilómetro." if objetivo else
-                  f"Tasa entre {_mgl(ba)} y {_mgl(bb)} mg/l con sintomatología o conducción anómala: influencia del alcohol en la conducción.")
+        motivo = (f"La tasa corregida ({_mgl(corr_ref)} mg/l, tras descontar el margen del etilómetro) es superior a {_mgl(umbral)} mg/l: tasa objetiva." if objetivo else
+                  f"Tasa corregida de {_mgl(corr_ref)} mg/l (entre {_mgl(ba)} y {_mgl(bb)}) con sintomatología o conducción anómala: influencia del alcohol en la conducción.")
         cab = [f"**Vía penal: presunto delito del art. 379.2 CP.** {motivo} Procede el atestado por presunto delito contra la seguridad vial.", "",
                "**Alternativa administrativa** (se rellena por si se desestima la vía penal; la penal prevalece):", ""]
         respuesta = "\n".join(cab + [f"**{resumen()}**", ""] + cuerpo())
         return _resultado("completo", "alcohol", etiqueta, "\n".join(bloque_modelo + [respuesta]), respuesta)
     extra = []
     if banda and sintomas is None:
-        extra.append(f"- Nota penal: con tasas entre {_mgl(ba)} y {_mgl(bb)} mg/l puede haber delito (art. 379.2 CP) si hay sintomatología o conducción anómala "
+        extra.append(f"- Nota penal: con tasas corregidas entre {_mgl(ba)} y {_mgl(bb)} mg/l puede haber delito (art. 379.2 CP) si hay sintomatología o conducción anómala "
                      "(maniobras anómalas, accidente, signos externos). Si los hay, indícalo y se tramita por vía penal.")
     if objetivo is False and m > bb:
         pass
@@ -1146,7 +1155,7 @@ _RE_ALC_NUM = re.compile(r"(?<![\d.,])(\d[.,]\d{1,3}|[.,]\d{1,3})(?![\d])\s*(mg/
 
 def _lee_parcial_alcohol(texto: str) -> dict:
     t = texto or ""
-    out = {"mediciones_mgl": [], "conductor": None, "reincidente": None, "sintomas": None, "tasa_corregida_mgl": None}
+    out = {"mediciones_mgl": [], "conductor": None, "reincidente": None, "sintomas": None, "tasa_corregida_mgl": None, "etilometro_nuevo": None}
     mc = re.search(r"corregid[ao]s?\s*(?:de|a|es|:)?\s*(\d?[.,]\d{1,3})", t, re.I) or re.search(r"(\d?[.,]\d{1,3})\s*(?:mg/?l)?\s*(?:ya\s+)?corregid", t, re.I)
     corr_span = mc.span(1) if mc else None
     if mc:
@@ -1176,6 +1185,8 @@ def _lee_parcial_alcohol(texto: str) -> dict:
         out["conductor"] = "profesional_novel"
     elif re.search(r"conductor general|\bgeneral\b|particular|\bnormal\b|ordinario|com[uú]n\b|corriente", low):
         out["conductor"] = "general"
+    if re.search(r"(?:etil[oó]metro|alcohol[ií]metro)\s+(?:nuevo|reci[eé]n)|nuevo\s+(?:etil[oó]metro|alcohol[ií]metro)|reci[eé]n\s+(?:reparado|verificado|calibrado)|primer\s+a[ñn]o", low):
+        out["etilometro_nuevo"] = True
     if re.search(r"reincident|sanci[oó]n firme|sancionad[oa]\s+(?:por\s+alcohol\s+)?(?:en|durante)\s+el\s+[uú]ltimo\s+a[ñn]o", low):
         out["reincidente"] = True
     elif re.search(r"sin antecedentes|primera vez|no (?:es )?reincident", low):

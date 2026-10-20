@@ -1,0 +1,38 @@
+ASISTENTE LEGAL - PAQUETE COMPLETO
+==================================
+
+QUÉ HACER
+1. Sustituye en tu proyecto TODO lo que hay aquí (app.py, calculos.py, buscador.py y la carpeta datos/ entera).
+   No subas archivos sueltos: app.py y calculos.py tienen que ser de la misma versión.
+2. Mantén tu logo.png y tus secretos (.streamlit/secrets.toml) como están. requirements.txt es el mismo de siempre.
+3. Despliega y mira la barra lateral. Debe poner EXACTAMENTE:
+      Versión: app 2026-10-alcohol-5 · calculos 2026-10-alcohol-5
+      Calculadoras: ON
+      Cuadro de velocidad: ON
+      Datos de alcohol: ON
+      Códigos de transporte cargados: 1071
+   Si falta alguna línea, esa es la causa: te dice qué archivo no está o está desactualizado.
+
+CONTENIDO
+  app.py               la aplicación
+  calculos.py          calculadoras: tiempos, masas, dimensiones, cargas, velocidad, alcohol
+  buscador.py          búsqueda por palabras clave (complementa a Pinecone)
+  datos/
+    baremo_transporte.json    fichas del baremo de transportes + tramos (tiempos y masas)
+    codificado_trafico.json   fichas de tráfico (RGC / LSV)
+    velocidad.json            cuadro del Anexo IV y márgenes de radares
+    alcohol.json              límites, márgenes del etilómetro (Orden ICT/155/2020) y umbrales penales
+    ref_penal.txt             norma penal (velocidad, alcohol, drogas, temeridad, negativa)
+    ref_inmovilizacion.txt    arts. 104 y 105 LSV, instrucción y criterio C1/D1
+  herramientas/        solo para regenerar los JSON si cambian los .txt (no hace falta subirla)
+
+CRITERIOS APLICADOS
+  - Alcohol: margen descontado a favor del conductor y tasa corregida TRUNCADA a 2 decimales. Delito objetivo si la corregida supera 0,60 mg/l
+    (con el 7,5 % equivale a medir 0,66). Entre 0,40 y 0,60 solo con síntomas o conducción anómala.
+  - Etilómetro: en servicio ±0,030 mg/l hasta 0,400 y 7,5 % por encima; nuevo/recién reparado ±0,020 y 5 %.
+  - Radar: fijo en servicio 5 km/h o 5 %; nuevo 3 km/h o 3 %; móvil nuevo 5 km/h o 5 %. Sin decir "nuevo", se usa el margen en servicio.
+
+PENDIENTE DE CONFIRMAR (la app funciona, pero pide el dato en estos casos)
+  - Margen del radar móvil con verificación periódica: ±7 de memoria (sin confirmar). Archivo: datos/velocidad.json
+  - Redondeo del margen porcentual de los radares por encima de 100 km/h: hacia abajo (afecta solo al borde de cada tramo).
+  - La ficha 5E del codificado aún cita la Orden ITC/3707/2006 (derogada): conviene actualizar ese comentario en tu fuente.
